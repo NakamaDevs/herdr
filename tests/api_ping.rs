@@ -1256,6 +1256,40 @@ fn agent_methods_round_trip_over_socket() {
 }
 
 #[test]
+fn agent_prompt_rejects_submit_false_with_wait_before_target_lookup() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+
+    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    // No workspace exists, so any target lookup would answer agent_not_found.
+    // Option validation must win before the server's wait preflight looks up
+    // or reconciles the target.
+    let rejected = send_request(
+        &socket_path,
+        r#"{"id":"agent_prompt_stage_wait","method":"agent.prompt","params":{"target":"missing","text":"staged","wait":{},"submit":false}}"#,
+    );
+    assert_eq!(rejected["id"], "agent_prompt_stage_wait");
+    assert_eq!(
+        rejected["error"]["code"], "agent_prompt_wait_requires_submit",
+        "{rejected}"
+    );
+
+    // Without wait, the same request still reaches target lookup.
+    let not_found = send_request(
+        &socket_path,
+        r#"{"id":"agent_prompt_stage","method":"agent.prompt","params":{"target":"missing","text":"staged","submit":false}}"#,
+    );
+    assert_eq!(not_found["error"]["code"], "agent_not_found", "{not_found}");
+
+    cleanup_spawned_herdr(child, base);
+}
+
+#[test]
 fn tab_create_with_no_focus_preserves_active_tab() {
     let _lock = test_lock();
     let base = unique_test_dir();

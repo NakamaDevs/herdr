@@ -182,6 +182,16 @@ pub(super) fn prompt_agent(
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<Option<String>> {
+    // Shared option validation runs before the wait preflight so invalid option
+    // combinations never reach target lookup or reconciliation.
+    if let Err(error) = params.validate_options() {
+        return serde_json::to_string(&ErrorResponse {
+            id: request_id,
+            error,
+        })
+        .map(Some)
+        .map_err(std::io::Error::other);
+    }
     let Some(wait) = params.wait.clone() else {
         return Ok(Some(dispatch_to_app_with_timeout(
             Request {

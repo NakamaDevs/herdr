@@ -4,6 +4,7 @@
 
 ### Added
 - Custom themes can now define separate light and dark color overrides when automatic theme switching is enabled. (#837, thanks @aneym)
+- `agent.prompt` now accepts an optional `submit` field; `submit: false` sends the prompt text with the usual readiness guards and encoding and never schedules Enter. It returns `agent_prompt_submit_pending` while the same pane still has a delayed Enter from an earlier prompt, and rejects `wait` with `agent_prompt_wait_requires_submit`.
 
 ### Fixed
 - New lifecycle event subscriptions now stream only events emitted after subscription begins instead of replaying retained history. (#1270)

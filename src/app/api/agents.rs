@@ -60,9 +60,10 @@ impl App {
     }
 
     pub(super) fn handle_agent_prompt(&mut self, id: String, params: AgentPromptParams) -> String {
-        if params.text.is_empty() {
-            return encode_error(id, "empty_agent_prompt", "agent prompt must not be empty");
+        if let Err(error) = params.validate_options() {
+            return encode_error_body(id, error);
         }
+        let submit = params.submit();
         let resolved = match self.resolve_agent_target(&params.target) {
             Ok(resolved) => resolved,
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
@@ -108,6 +109,18 @@ impl App {
                 ),
             );
         }
+        if !submit && runtime.pending_delayed_input_count() > 0 {
+            // Staged text must not be submitted by an Enter still pending from an
+            // earlier prompt on this pane. The pending Enter is left alone.
+            return encode_error(
+                id,
+                "agent_prompt_submit_pending",
+                format!(
+                    "agent {} has a pending Enter from an earlier prompt; retry after it is delivered",
+                    params.target
+                ),
+            );
+        }
         if expected_agent == crate::detect::Agent::GithubCopilot {
             // Copilot ignores synthetic Enter after focus loss until it receives focus gained.
             let focus = match crate::ghostty::encode_focus(crate::ghostty::FocusEvent::Gained) {
@@ -123,7 +136,9 @@ impl App {
         if let Err(err) = runtime.try_send_bytes(Bytes::from(text)) {
             return encode_error(id, "agent_prompt_failed", err.to_string());
         }
-        runtime.send_bytes_after(Bytes::from(enter), AGENT_PROMPT_SUBMIT_DELAY);
+        if submit {
+            runtime.send_bytes_after(Bytes::from(enter), AGENT_PROMPT_SUBMIT_DELAY);
+        }
         let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
             return agent_not_found(id, &params.target);
         };
@@ -357,6 +372,7 @@ mod tests {
                 target: public_pane_id,
                 text: "A != B".into(),
                 wait: None,
+                submit: None,
             },
         );
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -388,6 +404,7 @@ mod tests {
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
+                submit: None,
             },
         );
         let raw: SuccessResponse = serde_json::from_str(&raw).unwrap();
@@ -409,9 +426,346 @@ mod tests {
                 target: "opencode".into(),
                 text: "wrong target".into(),
                 wait: None,
+                submit: None,
             },
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
+        assert_eq!(error.error.code, "agent_not_found");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_submit_false_rejects_wait_before_sending() {
+        use crate::api::schema::AgentPromptWaitOptions;
+
+        for initial_state in [AgentState::Idle, AgentState::Working] {
+            let mut app = app_with_agent();
+            let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+            let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+                .attached_terminal_id
+                .clone();
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_agent_name("reviewer".into());
+            terminal.set_detected_state(Some(Agent::OpenCode), initial_state);
+            let (runtime, mut rx) =
+                crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                    80, 24, 0, b"", 2,
+                );
+            runtime.test_process_pty_bytes(b"\x1b[?2004h");
+            app.state.insert_test_runtime(pane_id, runtime);
+
+            let response = app.handle_agent_prompt(
+                "req-stage-wait".into(),
+                AgentPromptParams {
+                    target: "reviewer".into(),
+                    text: "A != B".into(),
+                    wait: Some(AgentPromptWaitOptions {
+                        until: Vec::new(),
+                        timeout_ms: None,
+                    }),
+                    submit: Some(false),
+                },
+            );
+            let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(
+                error.error.code, "agent_prompt_wait_requires_submit",
+                "state {initial_state:?}"
+            );
+            assert!(
+                tokio::time::timeout(
+                    AGENT_PROMPT_SUBMIT_DELAY * 2 + Duration::from_millis(100),
+                    rx.recv()
+                )
+                .await
+                .is_err(),
+                "submit=false with wait wrote terminal input for state {initial_state:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_submit_false_rejects_while_same_pane_enter_pending() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        let (runtime, mut rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80, 24, 0, b"", 4,
+            );
+        runtime.test_process_pty_bytes(b"\x1b[?2004h");
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        let submitted = app.handle_agent_prompt(
+            "req-submit".into(),
+            AgentPromptParams {
+                target: "reviewer".into(),
+                text: "first".into(),
+                wait: None,
+                submit: Some(true),
+            },
+        );
+        let submitted: SuccessResponse = serde_json::from_str(&submitted).unwrap();
+        assert!(matches!(
+            submitted.result,
+            ResponseResult::AgentPrompted { .. }
+        ));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Bytes::from_static(b"\x1b[200~first\x1b[201~")
+        );
+
+        // Staging while the first prompt's Enter is still pending is rejected
+        // without sending a body; the pending Enter is not cancelled.
+        let rejected = app.handle_agent_prompt(
+            "req-stage".into(),
+            AgentPromptParams {
+                target: "reviewer".into(),
+                text: "second".into(),
+                wait: None,
+                submit: Some(false),
+            },
+        );
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
+        assert_eq!(error.error.code, "agent_prompt_submit_pending");
+        assert!(rx.try_recv().is_err(), "rejected staging sent a body");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            Bytes::from_static(b"\r")
+        );
+
+        // Once the pending Enter has been delivered, staging succeeds.
+        let staged = app.handle_agent_prompt(
+            "req-stage-retry".into(),
+            AgentPromptParams {
+                target: "reviewer".into(),
+                text: "second".into(),
+                wait: None,
+                submit: Some(false),
+            },
+        );
+        let staged: SuccessResponse = serde_json::from_str(&staged).unwrap();
+        assert!(matches!(
+            staged.result,
+            ResponseResult::AgentPrompted { .. }
+        ));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Bytes::from_static(b"\x1b[200~second\x1b[201~")
+        );
+        assert!(
+            tokio::time::timeout(
+                AGENT_PROMPT_SUBMIT_DELAY * 2 + Duration::from_millis(100),
+                rx.recv()
+            )
+            .await
+            .is_err(),
+            "staged text was followed by terminal input"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_submit_false_succeeds_on_other_pane_while_enter_pending() {
+        let mut app = app_with_agent();
+        app.state.workspaces.push(Workspace::test_new("other"));
+        app.state.ensure_test_terminals();
+        let reviewer_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let other_pane = app.state.workspaces[1].tabs[0].root_pane;
+        let reviewer_terminal = app.state.workspaces[0].tabs[0].panes[&reviewer_pane]
+            .attached_terminal_id
+            .clone();
+        let other_terminal = app.state.workspaces[1].tabs[0].panes[&other_pane]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&reviewer_terminal).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        let terminal = app.state.terminals.get_mut(&other_terminal).unwrap();
+        terminal.set_agent_name("other".into());
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        let (reviewer_runtime, mut reviewer_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80, 24, 0, b"", 4,
+            );
+        reviewer_runtime.test_process_pty_bytes(b"\x1b[?2004h");
+        app.state.workspaces[0].insert_test_runtime(reviewer_pane, reviewer_runtime);
+        let (other_runtime, mut other_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80, 24, 0, b"", 4,
+            );
+        other_runtime.test_process_pty_bytes(b"\x1b[?2004h");
+        app.state.workspaces[1].insert_test_runtime(other_pane, other_runtime);
+
+        let submitted = app.handle_agent_prompt(
+            "req-submit".into(),
+            AgentPromptParams {
+                target: "reviewer".into(),
+                text: "first".into(),
+                wait: None,
+                submit: Some(true),
+            },
+        );
+        let submitted: SuccessResponse = serde_json::from_str(&submitted).unwrap();
+        assert!(matches!(
+            submitted.result,
+            ResponseResult::AgentPrompted { .. }
+        ));
+        assert_eq!(
+            reviewer_rx.try_recv().unwrap(),
+            Bytes::from_static(b"\x1b[200~first\x1b[201~")
+        );
+
+        let staged = app.handle_agent_prompt(
+            "req-stage-other".into(),
+            AgentPromptParams {
+                target: "other".into(),
+                text: "second".into(),
+                wait: None,
+                submit: Some(false),
+            },
+        );
+        let staged: SuccessResponse = serde_json::from_str(&staged).unwrap();
+        let ResponseResult::AgentPrompted { agent } = staged.result else {
+            panic!("expected prompted response");
+        };
+        assert_eq!(agent.name.as_deref(), Some("other"));
+        assert_eq!(
+            other_rx.try_recv().unwrap(),
+            Bytes::from_static(b"\x1b[200~second\x1b[201~")
+        );
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), reviewer_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            Bytes::from_static(b"\r")
+        );
+        assert!(
+            other_rx.try_recv().is_err(),
+            "other pane received extra input"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_submit_false_sends_body_without_enter() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        let (runtime, mut rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80, 24, 0, b"", 2,
+            );
+        runtime.test_process_pty_bytes(b"\x1b[?2004h");
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
+        let response = app.handle_agent_prompt(
+            "req-stage".into(),
+            AgentPromptParams {
+                target: "reviewer".into(),
+                text: "A != B".into(),
+                wait: None,
+                submit: Some(false),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentPrompted { agent } = success.result else {
+            panic!("expected prompted response");
+        };
+        assert_eq!(agent.name.as_deref(), Some("reviewer"));
+        assert_eq!(agent.terminal_id, terminal_id.to_string());
+        assert_eq!(agent.pane_id, public_pane_id);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Bytes::from_static(b"\x1b[200~A != B\x1b[201~")
+        );
+        assert!(
+            tokio::time::timeout(
+                AGENT_PROMPT_SUBMIT_DELAY * 2 + Duration::from_millis(100),
+                rx.recv()
+            )
+            .await
+            .is_err(),
+            "submit=false scheduled terminal input after the prompt body"
+        );
+
+        // submit=true must keep the current behavior: body, then delayed Enter.
+        let response = app.handle_agent_prompt(
+            "req-submit".into(),
+            AgentPromptParams {
+                target: "reviewer".into(),
+                text: "A != B".into(),
+                wait: None,
+                submit: Some(true),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::AgentPrompted { .. }
+        ));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Bytes::from_static(b"\x1b[200~A != B\x1b[201~")
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            Bytes::from_static(b"\r")
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_submit_false_keeps_readiness_guards() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::GithubCopilot), AgentState::Blocked);
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        let response = app.handle_agent_prompt(
+            "req-blocked".into(),
+            AgentPromptParams {
+                target: "reviewer".into(),
+                text: "unrelated prompt".into(),
+                wait: None,
+                submit: Some(false),
+            },
+        );
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "agent_blocked");
+        assert!(rx.try_recv().is_err());
+
+        let missing = app.handle_agent_prompt(
+            "req-missing".into(),
+            AgentPromptParams {
+                target: "nobody".into(),
+                text: "unrelated prompt".into(),
+                wait: None,
+                submit: Some(false),
+            },
+        );
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&missing).unwrap();
         assert_eq!(error.error.code, "agent_not_found");
         assert!(rx.try_recv().is_err());
     }
@@ -435,6 +789,7 @@ mod tests {
                 target: "reviewer".into(),
                 text: "unrelated prompt".into(),
                 wait: None,
+                submit: None,
             },
         );
 
@@ -474,6 +829,7 @@ mod tests {
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
+                submit: None,
             },
         );
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -558,6 +914,7 @@ mod tests {
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
+                submit: None,
             },
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();

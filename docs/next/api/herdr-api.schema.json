@@ -1224,6 +1224,13 @@
       "$defs": {
         "AgentPromptParams": {
           "properties": {
+            "submit": {
+              "description": "Whether to submit the prompt with Enter after the text. Defaults to true.\nWhen false, the text is sent with the same readiness guards and encoding\nand no Enter is scheduled. The request is rejected with\n`agent_prompt_submit_pending` while the pane still has a delayed Enter\nfrom an earlier prompt, and `wait` is rejected.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
             "target": {
               "type": "string"
             },

@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::io;
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 
@@ -1047,6 +1047,9 @@ pub struct PaneRuntime {
     full_lifecycle_authority_active: Arc<AtomicBool>,
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
+    /// Delayed inputs scheduled on this pane whose awaited delivery has not
+    /// completed or failed yet.
+    pending_delayed_input: Arc<AtomicUsize>,
     preserve_processes_on_drop: bool,
     // Task handles for deterministic shutdown
     detect_handle: Option<tokio::task::AbortHandle>,
@@ -1193,7 +1196,14 @@ impl PaneRuntimeIo {
         }
     }
 
-    fn send_bytes_after(&self, bytes: Bytes, delay: std::time::Duration) {
+    /// Send `bytes` after `delay`, awaiting queue capacity. `pending` is
+    /// released only after the awaited delivery completes or fails.
+    fn send_bytes_after(
+        &self,
+        bytes: Bytes,
+        delay: std::time::Duration,
+        pending: PendingDelayedInput,
+    ) {
         match self {
             PaneRuntimeIo::Actor(actor) => {
                 let actor = actor.clone();
@@ -1202,6 +1212,7 @@ impl PaneRuntimeIo {
                     if let Err(err) = actor.write_user_input(bytes).await {
                         warn!(error = %err, "failed to send delayed PTY input");
                     }
+                    drop(pending);
                 });
             }
             #[cfg(test)]
@@ -1210,9 +1221,27 @@ impl PaneRuntimeIo {
                 tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
                     let _ = sender.send(bytes).await;
+                    drop(pending);
                 });
             }
         }
+    }
+}
+
+/// Counts one in-flight delayed input; the count is released on drop, which
+/// happens only once the awaited delivery has completed or failed.
+struct PendingDelayedInput(Arc<AtomicUsize>);
+
+impl PendingDelayedInput {
+    fn begin(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self(Arc::clone(count))
+    }
+}
+
+impl Drop for PendingDelayedInput {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -2008,6 +2037,7 @@ impl PaneRuntime {
             full_lifecycle_authority_active,
             detect_reset_notify,
             pending_release,
+            pending_delayed_input: Arc::new(AtomicUsize::new(0)),
             preserve_processes_on_drop: true,
             detect_handle: Some(detect_handle),
         })
@@ -2559,6 +2589,7 @@ impl PaneRuntime {
             full_lifecycle_authority_active,
             detect_reset_notify,
             pending_release,
+            pending_delayed_input: Arc::new(AtomicUsize::new(0)),
             preserve_processes_on_drop: false,
             detect_handle,
         })
@@ -2843,7 +2874,15 @@ impl PaneRuntime {
     }
 
     pub fn send_bytes_after(&self, bytes: Bytes, delay: std::time::Duration) {
-        self.io.send_bytes_after(bytes, delay);
+        // Counted synchronously before scheduling so a caller observing the
+        // count right after this call sees the operation as pending.
+        let pending = PendingDelayedInput::begin(&self.pending_delayed_input);
+        self.io.send_bytes_after(bytes, delay, pending);
+    }
+
+    /// Number of delayed inputs whose awaited delivery is still outstanding.
+    pub fn pending_delayed_input_count(&self) -> usize {
+        self.pending_delayed_input.load(Ordering::Acquire)
     }
 
     pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {
@@ -3080,6 +3119,7 @@ impl PaneRuntime {
                 full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
                 detect_reset_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
+                pending_delayed_input: Arc::new(AtomicUsize::new(0)),
                 preserve_processes_on_drop: true,
                 detect_handle: Some(tokio::spawn(async {}).abort_handle()),
             },
@@ -3091,6 +3131,62 @@ impl PaneRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ENTER: &[u8] = b"\r";
+    const DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+    const SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
+
+    #[tokio::test]
+    async fn one_pending_delayed_input_counts_until_delivered() {
+        let (runtime, mut rx) = PaneRuntime::test_with_channel(80, 24);
+        assert_eq!(runtime.pending_delayed_input_count(), 0);
+
+        runtime.send_bytes_after(Bytes::from_static(ENTER), DELAY);
+
+        assert_eq!(runtime.pending_delayed_input_count(), 1);
+        assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(ENTER));
+        tokio::time::sleep(SETTLE).await;
+        assert_eq!(runtime.pending_delayed_input_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn two_pending_delayed_inputs_count_until_both_delivered() {
+        let (runtime, mut rx) = PaneRuntime::test_with_channel(80, 24);
+
+        runtime.send_bytes_after(Bytes::from_static(ENTER), DELAY);
+        runtime.send_bytes_after(Bytes::from_static(ENTER), DELAY * 2);
+
+        assert_eq!(runtime.pending_delayed_input_count(), 2);
+        assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(ENTER));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(runtime.pending_delayed_input_count(), 1);
+        assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(ENTER));
+        tokio::time::sleep(SETTLE).await;
+        assert_eq!(runtime.pending_delayed_input_count(), 0);
+    }
+
+    /// A full input queue must not drop the delayed input: delivery awaits
+    /// capacity, and the operation stays pending until it actually lands.
+    #[tokio::test]
+    async fn delayed_input_awaits_full_queue_and_stays_pending_until_delivered() {
+        let (runtime, mut rx) = PaneRuntime::test_with_channel_capacity(80, 24, 1);
+        runtime.try_send_bytes(Bytes::from_static(b"fill")).unwrap();
+
+        runtime.send_bytes_after(Bytes::from_static(ENTER), DELAY);
+
+        tokio::time::sleep(SETTLE).await;
+        assert_eq!(runtime.pending_delayed_input_count(), 1);
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"fill"));
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            Bytes::from_static(ENTER)
+        );
+        tokio::time::sleep(SETTLE).await;
+        assert_eq!(runtime.pending_delayed_input_count(), 0);
+    }
 
     #[test]
     fn pane_launch_env_removes_outer_codex_thread_id() {
@@ -3649,6 +3745,7 @@ mod tests {
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
+            pending_delayed_input: Arc::new(AtomicUsize::new(0)),
             preserve_processes_on_drop: true,
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
@@ -3681,6 +3778,7 @@ mod tests {
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
+            pending_delayed_input: Arc::new(AtomicUsize::new(0)),
             preserve_processes_on_drop: true,
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
