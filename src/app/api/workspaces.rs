@@ -315,6 +315,7 @@ impl App {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        self.mark_closed_runs_lost(&workspace_id, None);
         self.state.selected = index;
         self.state.close_selected_workspace();
         self.state.remove_plugin_pane_records(pane_ids);

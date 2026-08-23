@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use std::sync::{
@@ -1050,10 +1051,37 @@ pub struct PaneRuntime {
     /// Delayed inputs scheduled on this pane whose awaited delivery has not
     /// completed or failed yet.
     pending_delayed_input: Arc<AtomicUsize>,
+    pending_run_inputs: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     preserve_processes_on_drop: bool,
     // Task handles for deterministic shutdown
     detect_handle: Option<tokio::task::AbortHandle>,
 }
+
+fn lock_pending_run_inputs(
+    pending_run_inputs: &Mutex<HashMap<String, Arc<AtomicBool>>>,
+) -> std::sync::MutexGuard<'_, HashMap<String, Arc<AtomicBool>>> {
+    match pending_run_inputs.lock() {
+        Ok(pending_run_inputs) => pending_run_inputs,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn retire_pending_run_input(
+    pending_run_inputs: &Mutex<HashMap<String, Arc<AtomicBool>>>,
+    run_id: &str,
+    cancellation: &Arc<AtomicBool>,
+) {
+    let mut pending_run_inputs = lock_pending_run_inputs(pending_run_inputs);
+    if pending_run_inputs
+        .get(run_id)
+        .is_some_and(|current| Arc::ptr_eq(current, cancellation))
+    {
+        pending_run_inputs.remove(run_id);
+    }
+}
+
+#[cfg(test)]
+type TestInputObserver = Arc<dyn Fn(&Bytes) + Send + Sync>;
 
 enum PaneRuntimeIo {
     Actor(PtyIoActorHandle),
@@ -1061,6 +1089,7 @@ enum PaneRuntimeIo {
     TestChannel {
         sender: mpsc::Sender<Bytes>,
         resize_tx: watch::Sender<(u16, u16, u32, u32)>,
+        input_observer: Option<TestInputObserver>,
     },
 }
 
@@ -1180,7 +1209,20 @@ impl PaneRuntimeIo {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.try_write_user_input(bytes),
             #[cfg(test)]
-            PaneRuntimeIo::TestChannel { sender, .. } => sender.try_send(bytes),
+            PaneRuntimeIo::TestChannel {
+                sender,
+                input_observer,
+                ..
+            } => {
+                let observed = bytes.clone();
+                let result = sender.try_send(bytes);
+                if result.is_ok() {
+                    if let Some(observer) = input_observer {
+                        observer(&observed);
+                    }
+                }
+                result
+            }
         }
     }
 
@@ -1218,11 +1260,13 @@ impl PaneRuntimeIo {
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { sender, .. } => {
                 let sender = sender.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(delay).await;
-                    let _ = sender.send(bytes).await;
-                    drop(pending);
-                });
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    std::mem::drop(runtime.spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let _ = sender.send(bytes).await;
+                        drop(pending);
+                    }));
+                }
             }
         }
     }
@@ -1259,6 +1303,7 @@ impl Drop for PaneRuntime {
         if let Some(handle) = &self.detect_handle {
             handle.abort();
         }
+        self.cancel_all_scheduled_run_inputs();
         self.io.shutdown();
         if !self.preserve_processes_on_drop {
             shutdown_pane_processes(
@@ -1625,6 +1670,7 @@ impl PaneRuntime {
         if let Some(handle) = self.detect_handle.take() {
             handle.abort();
         }
+        self.cancel_all_scheduled_run_inputs();
         self.io.shutdown();
         shutdown_pane_processes(
             self.pane_id,
@@ -1651,6 +1697,7 @@ impl PaneRuntime {
         if let Some(handle) = self.detect_handle.take() {
             handle.abort();
         }
+        self.cancel_all_scheduled_run_inputs();
         self.preserve_processes_on_drop = true;
     }
 
@@ -2038,6 +2085,7 @@ impl PaneRuntime {
             detect_reset_notify,
             pending_release,
             pending_delayed_input: Arc::new(AtomicUsize::new(0)),
+            pending_run_inputs: Arc::new(Mutex::new(HashMap::new())),
             preserve_processes_on_drop: true,
             detect_handle: Some(detect_handle),
         })
@@ -2590,6 +2638,7 @@ impl PaneRuntime {
             detect_reset_notify,
             pending_release,
             pending_delayed_input: Arc::new(AtomicUsize::new(0)),
+            pending_run_inputs: Arc::new(Mutex::new(HashMap::new())),
             preserve_processes_on_drop: false,
             detect_handle,
         })
@@ -2885,6 +2934,66 @@ impl PaneRuntime {
         self.pending_delayed_input.load(Ordering::Acquire)
     }
 
+    pub fn schedule_run_bytes_after(
+        &self,
+        run_id: String,
+        bytes: Bytes,
+        delay: std::time::Duration,
+    ) {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let previous = lock_pending_run_inputs(&self.pending_run_inputs)
+            .insert(run_id.clone(), cancellation.clone());
+        if let Some(previous) = previous {
+            previous.store(true, Ordering::Release);
+        }
+        let pending_run_inputs = Arc::clone(&self.pending_run_inputs);
+        match &self.io {
+            PaneRuntimeIo::Actor(actor) => {
+                let actor = actor.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    if !cancellation.load(Ordering::Acquire) {
+                        if let Err(err) = actor.write_user_input(bytes).await {
+                            warn!(error = %err, "failed to send delayed run input");
+                        }
+                    }
+                    retire_pending_run_input(&pending_run_inputs, &run_id, &cancellation);
+                });
+            }
+            #[cfg(test)]
+            PaneRuntimeIo::TestChannel { sender, .. } => {
+                let sender = sender.clone();
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    std::mem::drop(runtime.spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        if !cancellation.load(Ordering::Acquire) {
+                            let _ = sender.send(bytes).await;
+                        }
+                        retire_pending_run_input(&pending_run_inputs, &run_id, &cancellation);
+                    }));
+                } else {
+                    cancellation.store(true, Ordering::Release);
+                    retire_pending_run_input(&pending_run_inputs, &run_id, &cancellation);
+                }
+            }
+        }
+    }
+
+    pub fn cancel_scheduled_run_input(&self, run_id: &str) {
+        if let Some(cancellation) = lock_pending_run_inputs(&self.pending_run_inputs).remove(run_id)
+        {
+            cancellation.store(true, Ordering::Release);
+        }
+    }
+
+    fn cancel_all_scheduled_run_inputs(&self) {
+        let mut pending_run_inputs = lock_pending_run_inputs(&self.pending_run_inputs);
+        for cancellation in pending_run_inputs.values() {
+            cancellation.store(true, Ordering::Release);
+        }
+        pending_run_inputs.clear();
+    }
+
     pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {
         self.send_bytes(self.paste_payload(text)).await
     }
@@ -3066,6 +3175,24 @@ impl PaneRuntime {
         Self::test_with_channel_and_scrollback_bytes(cols, rows, 0, &[], capacity)
     }
 
+    pub(crate) fn test_with_channel_and_input_observer<F>(
+        cols: u16,
+        rows: u16,
+        input_observer: F,
+    ) -> (Self, mpsc::Receiver<Bytes>)
+    where
+        F: Fn(&Bytes) + Send + Sync + 'static,
+    {
+        Self::test_with_channel_and_scrollback_bytes_with_observer(
+            cols,
+            rows,
+            0,
+            &[],
+            4,
+            Some(Arc::new(input_observer)),
+        )
+    }
+
     pub(crate) fn test_with_screen_bytes(cols: u16, rows: u16, bytes: &[u8]) -> Self {
         Self::test_with_scrollback_bytes(cols, rows, 0, bytes)
     }
@@ -3093,6 +3220,24 @@ impl PaneRuntime {
         bytes: &[u8],
         channel_capacity: usize,
     ) -> (Self, mpsc::Receiver<Bytes>) {
+        Self::test_with_channel_and_scrollback_bytes_with_observer(
+            cols,
+            rows,
+            scrollback_limit_bytes,
+            bytes,
+            channel_capacity,
+            None,
+        )
+    }
+
+    fn test_with_channel_and_scrollback_bytes_with_observer(
+        cols: u16,
+        rows: u16,
+        scrollback_limit_bytes: usize,
+        bytes: &[u8],
+        channel_capacity: usize,
+        input_observer: Option<TestInputObserver>,
+    ) -> (Self, mpsc::Receiver<Bytes>) {
         let (tx, rx) = mpsc::channel(channel_capacity);
         let (resize_tx, _resize_rx) = watch::channel((rows, cols, 0, 0));
         let mut terminal =
@@ -3108,6 +3253,7 @@ impl PaneRuntime {
                 io: PaneRuntimeIo::TestChannel {
                     sender: tx,
                     resize_tx,
+                    input_observer,
                 },
                 current_size: Cell::new((rows, cols, 0, 0)),
                 child_pid: Arc::new(AtomicU32::new(0)),
@@ -3120,6 +3266,7 @@ impl PaneRuntime {
                 detect_reset_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
                 pending_delayed_input: Arc::new(AtomicUsize::new(0)),
+                pending_run_inputs: Arc::new(Mutex::new(HashMap::new())),
                 preserve_processes_on_drop: true,
                 detect_handle: Some(tokio::spawn(async {}).abort_handle()),
             },
@@ -3734,6 +3881,7 @@ mod tests {
             io: PaneRuntimeIo::TestChannel {
                 sender: tx,
                 resize_tx,
+                input_observer: None,
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
@@ -3746,6 +3894,7 @@ mod tests {
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             pending_delayed_input: Arc::new(AtomicUsize::new(0)),
+            pending_run_inputs: Arc::new(Mutex::new(HashMap::new())),
             preserve_processes_on_drop: true,
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
@@ -3767,6 +3916,7 @@ mod tests {
             io: PaneRuntimeIo::TestChannel {
                 sender: tx,
                 resize_tx,
+                input_observer: None,
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
@@ -3779,6 +3929,7 @@ mod tests {
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             pending_delayed_input: Arc::new(AtomicUsize::new(0)),
+            pending_run_inputs: Arc::new(Mutex::new(HashMap::new())),
             preserve_processes_on_drop: true,
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };

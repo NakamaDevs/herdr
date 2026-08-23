@@ -89,6 +89,7 @@ mod release_notes;
 mod remote;
 mod render_prof;
 mod render_signal;
+mod runs;
 mod selection;
 mod server;
 mod session;
