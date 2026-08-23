@@ -3647,6 +3647,154 @@
           ],
           "type": "string"
         },
+        "RunCancelParams": {
+          "additionalProperties": false,
+          "properties": {
+            "capability": {
+              "$ref": "#/schemas/request/$defs/RunCapabilityRef"
+            },
+            "run_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "capability",
+            "run_id"
+          ],
+          "type": "object"
+        },
+        "RunCapabilityIssueParams": {
+          "additionalProperties": false,
+          "properties": {
+            "operations": {
+              "items": {
+                "$ref": "#/schemas/request/$defs/RunOperation"
+              },
+              "type": "array"
+            },
+            "ttl_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "workspace_id",
+            "ttl_ms",
+            "operations"
+          ],
+          "type": "object"
+        },
+        "RunCapabilityRef": {
+          "additionalProperties": false,
+          "properties": {
+            "capability_id": {
+              "type": "string"
+            },
+            "sequence": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "capability_id",
+            "sequence"
+          ],
+          "type": "object"
+        },
+        "RunCheckout": {
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "type": "object"
+        },
+        "RunOperation": {
+          "description": "Run operations a capability can authorize.",
+          "enum": [
+            "submit",
+            "status",
+            "cancel"
+          ],
+          "type": "string"
+        },
+        "RunStatusParams": {
+          "additionalProperties": false,
+          "properties": {
+            "capability": {
+              "$ref": "#/schemas/request/$defs/RunCapabilityRef"
+            },
+            "run_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "capability",
+            "run_id"
+          ],
+          "type": "object"
+        },
+        "RunSubmitParams": {
+          "additionalProperties": false,
+          "properties": {
+            "capability": {
+              "$ref": "#/schemas/request/$defs/RunCapabilityRef"
+            },
+            "checkout": {
+              "$ref": "#/schemas/request/$defs/RunCheckout"
+            },
+            "idempotency_key": {
+              "type": "string"
+            },
+            "prompt": {
+              "type": "string"
+            },
+            "target": {
+              "$ref": "#/schemas/request/$defs/RunTarget"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "capability",
+            "idempotency_key",
+            "workspace_id",
+            "checkout",
+            "target",
+            "prompt"
+          ],
+          "type": "object"
+        },
+        "RunTarget": {
+          "additionalProperties": false,
+          "properties": {
+            "agent_name": {
+              "type": "string"
+            },
+            "agent_session_id": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "agent_name",
+            "agent_session_id"
+          ],
+          "type": "object"
+        },
         "ServerLiveHandoffParams": {
           "properties": {
             "expected_protocol": {
@@ -4579,6 +4727,70 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "run.capability.issue",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/RunCapabilityIssueParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "run.submit",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/RunSubmitParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "run.status",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/RunStatusParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "run.cancel",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/RunCancelParams"
             }
           },
           "required": [
@@ -6336,6 +6548,48 @@
             "unknown"
           ],
           "type": "string"
+        },
+        "Capability": {
+          "description": "Durable capability record.",
+          "properties": {
+            "capability_id": {
+              "type": "string"
+            },
+            "expires_at_unix": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "issued_at_unix": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "last_sequence": {
+              "default": 0,
+              "description": "Highest sequence already consumed. A reference must exceed it.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "operations": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/RunOperation"
+              },
+              "type": "array"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "capability_id",
+            "workspace_id",
+            "operations",
+            "issued_at_unix",
+            "expires_at_unix"
+          ],
+          "type": "object"
         },
         "ClientWindowTitleReason": {
           "enum": [
@@ -8658,6 +8912,74 @@
             },
             {
               "properties": {
+                "capability": {
+                  "$ref": "#/schemas/success_response/$defs/Capability"
+                },
+                "type": {
+                  "const": "run_capability_issued",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "capability"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "deduplicated": {
+                  "type": "boolean"
+                },
+                "run": {
+                  "$ref": "#/schemas/success_response/$defs/RunRecord"
+                },
+                "type": {
+                  "const": "run_submitted",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run",
+                "deduplicated"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "run": {
+                  "$ref": "#/schemas/success_response/$defs/RunRecord"
+                },
+                "type": {
+                  "const": "run_status",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "run": {
+                  "$ref": "#/schemas/success_response/$defs/RunRecord"
+                },
+                "type": {
+                  "const": "run_cancel_requested",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "snapshot": {
                   "$ref": "#/schemas/success_response/$defs/SessionSnapshot"
                 },
@@ -9793,6 +10115,187 @@
                 "type"
               ],
               "type": "object"
+            }
+          ]
+        },
+        "RunFailureKind": {
+          "description": "Typed, bounded reason a run failed. Never carries free text.",
+          "oneOf": [
+            {
+              "const": "agent_unavailable",
+              "description": "The bound pane or agent was not usable at submit time.",
+              "type": "string"
+            },
+            {
+              "const": "prompt_rejected",
+              "description": "The agent refused the prompt or the write failed.",
+              "type": "string"
+            },
+            {
+              "const": "provider_exited",
+              "description": "The provider process exited before the run reached an observed outcome.",
+              "type": "string"
+            },
+            {
+              "const": "checkout_unavailable",
+              "description": "The bound checkout was not resolvable.",
+              "type": "string"
+            },
+            {
+              "const": "server_restart",
+              "description": "The binding did not survive a server restart.",
+              "type": "string"
+            },
+            {
+              "const": "internal",
+              "description": "The server could not complete the operation.",
+              "type": "string"
+            }
+          ]
+        },
+        "RunOperation": {
+          "description": "Run operations a capability can authorize.",
+          "enum": [
+            "submit",
+            "status",
+            "cancel"
+          ],
+          "type": "string"
+        },
+        "RunRecord": {
+          "description": "Durable run record. Serialized verbatim into the registry file and into the\nAPI response, so every field here must stay free of terminal content.",
+          "properties": {
+            "activity_seen": {
+              "default": false,
+              "description": "Set once the bound agent was observed doing work for this run.",
+              "type": "boolean"
+            },
+            "agent_name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "agent_session_id": {
+              "type": "string"
+            },
+            "checkout_path": {
+              "type": "string"
+            },
+            "created_at_unix": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "failure": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/RunFailureKind"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "finished_at_unix": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "prompt_bytes": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "prompt_digest": {
+              "description": "Lowercase hex sha256 of the submitted prompt.",
+              "type": "string"
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "started_at_unix": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "state": {
+              "$ref": "#/schemas/success_response/$defs/RunState"
+            },
+            "updated_at_unix": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id",
+            "workspace_id",
+            "checkout_path",
+            "pane_id",
+            "agent_session_id",
+            "prompt_digest",
+            "prompt_bytes",
+            "state",
+            "created_at_unix",
+            "updated_at_unix"
+          ],
+          "type": "object"
+        },
+        "RunState": {
+          "description": "Lifecycle state of a run.",
+          "oneOf": [
+            {
+              "const": "queued",
+              "description": "Accepted and bound, prompt not delivered yet.",
+              "type": "string"
+            },
+            {
+              "const": "running",
+              "description": "Prompt delivered to the bound agent.",
+              "type": "string"
+            },
+            {
+              "const": "blocked",
+              "description": "Bound agent needs interactive input.",
+              "type": "string"
+            },
+            {
+              "const": "succeeded",
+              "description": "Bound agent returned to idle after doing work.",
+              "type": "string"
+            },
+            {
+              "const": "failed",
+              "description": "The run could not be delivered or the bound agent went away mid-flight.",
+              "type": "string"
+            },
+            {
+              "const": "cancel_requested",
+              "description": "Cancellation accepted and signalled, not observed as stopped yet.",
+              "type": "string"
+            },
+            {
+              "const": "cancelled",
+              "description": "Cancellation observed as stopped.",
+              "type": "string"
+            },
+            {
+              "const": "lost",
+              "description": "Outcome is unknown because the binding disappeared.",
+              "type": "string"
             }
           ]
         },

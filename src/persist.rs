@@ -7,6 +7,7 @@
 mod io;
 pub mod plugin_registry;
 mod restore;
+pub mod run_registry;
 mod snapshot;
 
 pub use self::io::{clear, clear_history, load, load_history, save};

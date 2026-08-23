@@ -20,6 +20,7 @@ use super::session::SessionSnapshot;
 use super::tabs::TabInfo;
 use super::workspaces::WorkspaceInfo;
 use super::worktrees::{WorktreeInfo, WorktreeSourceInfo};
+use crate::runs::{auth::Capability, RunRecord};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SuccessResponse {
@@ -47,6 +48,19 @@ pub enum ResponseResult {
         protocol: u32,
         #[serde(default)]
         capabilities: Option<ServerCapabilities>,
+    },
+    RunCapabilityIssued {
+        capability: Capability,
+    },
+    RunSubmitted {
+        run: RunRecord,
+        deduplicated: bool,
+    },
+    RunStatus {
+        run: RunRecord,
+    },
+    RunCancelRequested {
+        run: RunRecord,
     },
     SessionSnapshot {
         snapshot: Box<SessionSnapshot>,

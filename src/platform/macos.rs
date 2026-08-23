@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
 use std::io::Write;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -9,8 +9,49 @@ use std::sync::OnceLock;
 
 use super::{
     read_limited_reader, ClipboardCommand, ClipboardImage, ForegroundJob, ForegroundProcess,
-    LimitedRead, Signal,
+    LimitedRead, PeerAuthority, Signal,
 };
+
+pub(crate) fn local_socket_peer_authority(
+    stream: &crate::ipc::LocalStream,
+) -> Option<PeerAuthority> {
+    let crate::ipc::LocalStream::UdSocket(stream) = stream;
+    let mut uid = 0;
+    let mut gid = 0;
+    let result = unsafe { libc::getpeereid(stream.inner().as_raw_fd(), &mut uid, &mut gid) };
+    if result != 0 {
+        return Some(PeerAuthority::Unknown);
+    }
+    Some(peer_authority_for_uids(uid, unsafe { libc::geteuid() }))
+}
+
+pub(crate) fn peer_authority_for_uids(
+    peer_uid: libc::uid_t,
+    effective_uid: libc::uid_t,
+) -> PeerAuthority {
+    if peer_uid == effective_uid {
+        PeerAuthority::Owner
+    } else {
+        PeerAuthority::OtherUser
+    }
+}
+
+pub(crate) fn replace_file_atomically(
+    temporary: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    std::fs::rename(temporary, destination)
+}
+
+pub(crate) fn sync_parent_directory(path: &std::path::Path) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "durable registry path has no parent directory",
+        )
+    })?;
+    std::fs::File::open(parent)?.sync_all()
+}
 
 pub(crate) use super::unix_common::{
     configure_status_command, create_remote_private_dir, create_remote_ssh_config_dir,

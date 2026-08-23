@@ -61,6 +61,153 @@ fn request_uses_dot_method_names() {
     assert_eq!(json["method"], "workspace.create");
 }
 
+// Matrix row 17. The versioned socket accepts only the four durable-run wire contracts.
+#[test]
+fn durable_run_socket_contracts_round_trip_without_extra_params() {
+    let requests = [
+        serde_json::json!({
+            "id": "issue",
+            "method": "run.capability.issue",
+            "params": {"workspace_id": "w1", "ttl_ms": 60000, "operations": ["submit", "status", "cancel"]}
+        }),
+        serde_json::json!({
+            "id": "submit",
+            "method": "run.submit",
+            "params": {"capability": {"capability_id": "cap_1", "sequence": 1}, "idempotency_key": "key-1", "workspace_id": "w1", "checkout": {"path": "/tmp/repo-a"}, "target": {"pane_id": "w1:p1", "agent_name": "reviewer", "agent_session_id": "session-1"}, "prompt": "review"}
+        }),
+        serde_json::json!({
+            "id": "status",
+            "method": "run.status",
+            "params": {"capability": {"capability_id": "cap_1", "sequence": 2}, "run_id": "run_1"}
+        }),
+        serde_json::json!({
+            "id": "cancel",
+            "method": "run.cancel",
+            "params": {"capability": {"capability_id": "cap_1", "sequence": 3}, "run_id": "run_1"}
+        }),
+    ];
+
+    for request in requests {
+        let parsed: Request = serde_json::from_value(request.clone())
+            .expect("the versioned durable-run request must deserialize");
+        assert_eq!(serde_json::to_value(parsed).unwrap(), request);
+    }
+
+    for response in [
+        serde_json::json!({"id": "issue", "result": {"type": "run_capability_issued", "capability": {"capability_id": "cap_1", "workspace_id": "w1", "operations": ["submit"], "issued_at_unix": 1700000000, "expires_at_unix": 1700000060, "last_sequence": 0}}}),
+        serde_json::json!({"id": "submit", "result": {"type": "run_submitted", "run": {"run_id": "run_1", "state": "queued", "workspace_id": "w1", "checkout_path": "/tmp/repo-a", "pane_id": "w1:p1", "agent_name": "reviewer", "agent_session_id": "session-1", "prompt_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "prompt_bytes": 6, "created_at_unix": 1700000000, "updated_at_unix": 1700000000, "activity_seen": false}, "deduplicated": false}}),
+        serde_json::json!({"id": "status", "result": {"type": "run_status", "run": {"run_id": "run_1", "state": "running", "workspace_id": "w1", "checkout_path": "/tmp/repo-a", "pane_id": "w1:p1", "agent_name": "reviewer", "agent_session_id": "session-1", "prompt_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "prompt_bytes": 6, "created_at_unix": 1700000000, "updated_at_unix": 1700000001, "started_at_unix": 1700000001, "activity_seen": false}}}),
+        serde_json::json!({"id": "cancel", "result": {"type": "run_cancel_requested", "run": {"run_id": "run_1", "state": "cancel_requested", "workspace_id": "w1", "checkout_path": "/tmp/repo-a", "pane_id": "w1:p1", "agent_name": "reviewer", "agent_session_id": "session-1", "prompt_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "prompt_bytes": 6, "created_at_unix": 1700000000, "updated_at_unix": 1700000002, "activity_seen": false}}}),
+    ] {
+        let parsed = serde_json::from_value::<SuccessResponse>(response.clone())
+            .expect("the versioned durable-run response must deserialize");
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), response);
+        assert!(
+            serde_json::to_vec(&parsed)
+                .expect("success response serializes")
+                .len()
+                <= crate::runs::MAX_RUN_RESULT_BYTES,
+            "the complete result envelope must stay within MAX_RUN_RESULT_BYTES"
+        );
+    }
+
+    let largest_valid_envelope = SuccessResponse {
+        id: "result-bound".to_string(),
+        result: ResponseResult::RunStatus {
+            run: crate::runs::RunRecord {
+                run_id: "run_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                workspace_id: "w1".to_string(),
+                checkout_path: "/".repeat(crate::runs::MAX_CHECKOUT_PATH_LEN),
+                pane_id: "w1:p1".to_string(),
+                agent_name: Some("reviewer".to_string()),
+                agent_session_id: "session-a".to_string(),
+                prompt_digest: "a".repeat(64),
+                prompt_bytes: crate::runs::MAX_PROMPT_BYTES as u32,
+                state: crate::runs::RunState::Failed,
+                failure: Some(crate::runs::RunFailureKind::ProviderExited),
+                created_at_unix: 1_700_000_000,
+                updated_at_unix: 1_700_000_001,
+                started_at_unix: Some(1_700_000_000),
+                finished_at_unix: Some(1_700_000_001),
+                activity_seen: true,
+            },
+        },
+    };
+    assert!(
+        serde_json::to_vec(&largest_valid_envelope)
+            .expect("largest success response serializes")
+            .len()
+            <= crate::runs::MAX_RUN_RESULT_BYTES,
+        "the maximum valid SuccessResponse envelope must stay bounded"
+    );
+}
+
+#[test]
+fn durable_run_protocol_rejects_missing_wrong_unknown_fields_and_invalid_values() {
+    let invalid = [
+        serde_json::json!({"id":"req-a1", "method":"run.submit", "params": {}}),
+        serde_json::json!({"id":"req-b2", "method":"run.status", "params": {"capability":"cap_1", "run_id": 7}}),
+        serde_json::json!({"id":"req-c3", "method":"run.cancel", "params": {"capability":{"capability_id":"cap_1","sequence":1}, "run_id":"run_1", "extra":true}}),
+        serde_json::json!({"id":"req-x7q", "method":"run.capability.issue", "params": {"workspace_id":"w1", "ttl_ms":60000, "operations":["delete"]}}),
+    ];
+    for request in invalid {
+        let id = request["id"].as_str().unwrap().to_string();
+        let error = serde_json::from_value::<Request>(request).unwrap_err();
+        assert!(
+            !error.to_string().contains(&id),
+            "parser error must not echo request id"
+        );
+    }
+}
+
+#[test]
+fn durable_run_error_responses_round_trip_exactly_with_stable_codes_and_request_ids() {
+    let caller_values = [
+        "idempotency-sk-live-secret",
+        "workspace-secret",
+        "/tmp/checkout-secret",
+        "pane-secret",
+        "agent-secret",
+        "session-secret",
+        "\u{1b}[31mprompt-secret\u{1b}[0m",
+    ];
+    for error in [
+        crate::runs::RunError::InvalidRequest(crate::runs::RunInvalidField::Prompt),
+        crate::runs::RunError::IdempotencyConflict,
+        crate::runs::RunError::CheckoutMismatch,
+        crate::runs::RunError::NotFound,
+        crate::runs::RunError::NotCancellable,
+        crate::runs::RunError::CapabilityInvalid,
+        crate::runs::RunError::ReplayRejected,
+        crate::runs::RunError::Unauthorized,
+        crate::runs::RunError::TargetUnavailable,
+    ] {
+        let response = ErrorResponse {
+            id: "run-error-request-id".to_string(),
+            error: ErrorBody {
+                code: error.code().to_string(),
+                message: error.message(),
+            },
+        };
+        let value = serde_json::to_value(&response).expect("error response serializes");
+        let reloaded: ErrorResponse =
+            serde_json::from_value(value.clone()).expect("error response deserializes");
+        assert_eq!(reloaded, response);
+        assert_eq!(value["id"], "run-error-request-id");
+        assert_eq!(value["error"]["code"], error.code());
+        for caller_value in caller_values {
+            assert!(
+                !value["error"]["message"]
+                    .as_str()
+                    .expect("error message")
+                    .contains(caller_value),
+                "{} response leaked caller input",
+                error.code()
+            );
+        }
+    }
+}
+
 #[test]
 fn agent_start_and_prompt_requests_round_trip() {
     let start = Request {

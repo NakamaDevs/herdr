@@ -1,7 +1,7 @@
 use std::{
     collections::{HashSet, VecDeque},
     io::Write,
-    os::fd::RawFd,
+    os::fd::{AsRawFd, RawFd},
     path::PathBuf,
     process::{Command, Stdio},
     sync::OnceLock,
@@ -9,8 +9,63 @@ use std::{
 
 use super::{
     read_limited_reader, ClipboardCommand, ClipboardImage, ForegroundJob, ForegroundProcess,
-    LimitedRead, Signal,
+    LimitedRead, PeerAuthority, Signal,
 };
+
+pub(crate) fn local_socket_peer_authority(
+    stream: &crate::ipc::LocalStream,
+) -> Option<PeerAuthority> {
+    let crate::ipc::LocalStream::UdSocket(stream) = stream;
+    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::zeroed();
+    let expected_len = std::mem::size_of::<libc::ucred>();
+    let Some(mut length) = libc::socklen_t::try_from(expected_len).ok() else {
+        return Some(PeerAuthority::Unknown);
+    };
+    let result = unsafe {
+        libc::getsockopt(
+            stream.inner().as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            credentials.as_mut_ptr().cast(),
+            &mut length,
+        )
+    };
+    if result != 0 || usize::try_from(length).ok() != Some(expected_len) {
+        return Some(PeerAuthority::Unknown);
+    }
+    Some(peer_authority_for_uids(
+        unsafe { credentials.assume_init() }.uid,
+        unsafe { libc::geteuid() },
+    ))
+}
+
+pub(crate) fn peer_authority_for_uids(
+    peer_uid: libc::uid_t,
+    effective_uid: libc::uid_t,
+) -> PeerAuthority {
+    if peer_uid == effective_uid {
+        PeerAuthority::Owner
+    } else {
+        PeerAuthority::OtherUser
+    }
+}
+
+pub(crate) fn replace_file_atomically(
+    temporary: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    std::fs::rename(temporary, destination)
+}
+
+pub(crate) fn sync_parent_directory(path: &std::path::Path) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "durable registry path has no parent directory",
+        )
+    })?;
+    std::fs::File::open(parent)?.sync_all()
+}
 
 pub(crate) use super::unix_common::{
     configure_status_command, create_remote_private_dir, create_remote_ssh_config_dir,

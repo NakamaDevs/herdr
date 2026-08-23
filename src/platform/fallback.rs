@@ -3,6 +3,23 @@ use std::process::Command;
 
 use super::{ClipboardImage, ForegroundJob, Signal};
 
+pub(crate) fn local_socket_peer_authority(
+    _stream: &crate::ipc::LocalStream,
+) -> Option<super::PeerAuthority> {
+    Some(super::PeerAuthority::Unknown)
+}
+
+pub(crate) fn replace_file_atomically(
+    temporary: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    std::fs::rename(temporary, destination)
+}
+
+pub(crate) fn sync_parent_directory(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 #[cfg(unix)]
 pub(crate) use super::unix_common::set_default_plugin_pane_pwd;
 
