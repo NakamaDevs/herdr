@@ -462,6 +462,19 @@ impl TerminalRuntime {
         self.0.send_bytes_after(bytes, delay);
     }
 
+    pub fn schedule_run_bytes_after(
+        &self,
+        run_id: String,
+        bytes: Bytes,
+        delay: std::time::Duration,
+    ) {
+        self.0.schedule_run_bytes_after(run_id, bytes, delay);
+    }
+
+    pub fn cancel_scheduled_run_input(&self, run_id: &str) {
+        self.0.cancel_scheduled_run_input(run_id);
+    }
+
     pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {
         self.0.send_paste(text).await
     }
@@ -586,6 +599,22 @@ impl TerminalRuntime {
     ) -> (Self, mpsc::Receiver<Bytes>) {
         let (runtime, rx) =
             crate::pane::PaneRuntime::test_with_channel_capacity(cols, rows, capacity);
+        (Self(runtime), rx)
+    }
+
+    pub(crate) fn test_with_channel_and_input_observer<F>(
+        cols: u16,
+        rows: u16,
+        input_observer: F,
+    ) -> (Self, mpsc::Receiver<Bytes>)
+    where
+        F: Fn(&Bytes) + Send + Sync + 'static,
+    {
+        let (runtime, rx) = crate::pane::PaneRuntime::test_with_channel_and_input_observer(
+            cols,
+            rows,
+            input_observer,
+        );
         (Self(runtime), rx)
     }
 

@@ -1568,6 +1568,7 @@ impl App {
                 "closing this pane would close a worktree group",
             ));
         }
+        self.mark_closed_runs_lost(&workspace_id, Some(&public_pane_id));
         let workspace_snapshot = self.workspace_info(ws_idx);
         let terminal_id = self.state.terminal_id_for_pane(ws_idx, pane_id);
         let should_close_workspace = {

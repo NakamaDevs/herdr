@@ -25,6 +25,41 @@ pub enum Signal {
     Kill,
 }
 
+/// Authority reported for a local API socket peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerAuthority {
+    Owner,
+    OtherUser,
+    Unknown,
+}
+
+/// Durable-run operation that needs an owner-authorized socket peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunSocketOperation {
+    CapabilityIssue,
+    Submit,
+    Status,
+    Cancel,
+}
+
+/// Peer-authority failure for durable-run socket methods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunPeerAuthorityError {
+    NotOwner,
+}
+
+/// Apply the fail-closed run peer policy after transport identifies the peer.
+pub(crate) fn assert_run_peer_authority(
+    peer: PeerAuthority,
+    operation: RunSocketOperation,
+) -> Result<(), RunPeerAuthorityError> {
+    let _ = operation;
+    match peer {
+        PeerAuthority::Owner => Ok(()),
+        PeerAuthority::OtherUser | PeerAuthority::Unknown => Err(RunPeerAuthorityError::NotOwner),
+    }
+}
+
 pub(crate) fn detached_custom_command_process(command: &str) -> std::process::Command {
     let mut process = detached_custom_command_process_platform(command);
     configure_background_command(&mut process);
@@ -379,6 +414,37 @@ impl PrefixInputSource for RealPrefixInputSource {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    // Matrix row 25. Every mutating or read run method requires an owner peer.
+    #[test]
+    fn durable_run_socket_methods_require_an_owner_peer() {
+        for operation in [
+            RunSocketOperation::CapabilityIssue,
+            RunSocketOperation::Submit,
+            RunSocketOperation::Status,
+            RunSocketOperation::Cancel,
+        ] {
+            assert_eq!(
+                assert_run_peer_authority(PeerAuthority::Owner, operation),
+                Ok(()),
+                "owner peer must use {operation:?}"
+            );
+            assert_eq!(
+                assert_run_peer_authority(PeerAuthority::OtherUser, operation),
+                Err(RunPeerAuthorityError::NotOwner)
+            );
+            assert_eq!(
+                assert_run_peer_authority(PeerAuthority::Unknown, operation),
+                Err(RunPeerAuthorityError::NotOwner)
+            );
+        }
+    }
+
+    #[test]
+    fn unix_peer_uid_maps_only_the_effective_user_to_owner() {
+        assert_eq!(peer_authority_for_uids(501, 501), PeerAuthority::Owner);
+        assert_eq!(peer_authority_for_uids(502, 501), PeerAuthority::OtherUser);
+    }
 
     #[test]
     fn terminal_resize_signal_is_recorded_once_per_delivery() {

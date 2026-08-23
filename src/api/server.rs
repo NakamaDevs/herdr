@@ -17,10 +17,11 @@ use crate::api::subscriptions::ActiveSubscription;
 use crate::api::wait::{prompt_agent, wait_for_agent, wait_for_event, wait_for_output};
 use crate::api::{request_changes_ui, socket_path, ApiRequestMessage, ApiRequestSender, EventHub};
 use crate::ipc::{
-    bind_local_listener, is_connection_closed_error, local_stream_peer_closed,
+    bind_private_local_listener, is_connection_closed_error, local_stream_peer_closed,
     poll_local_stream_read, remove_socket_file_if_owned, set_local_stream_polling,
     socket_file_identity, LocalStream, LocalStreamRead, SocketFileIdentity,
 };
+use crate::runs::RunError;
 
 mod pane_graphics_stream;
 
@@ -88,7 +89,7 @@ fn start_server_inner(
     let path = socket_path();
     prepare_socket_path(&path)?;
 
-    let listener = bind_local_listener(&path)?;
+    let listener = bind_private_local_listener(&path)?;
     restrict_socket_permissions(&path)?;
     let identity = socket_file_identity(&path)?;
     info!(path = %path.display(), "api server listening");
@@ -105,6 +106,12 @@ fn start_server_inner(
                     let server_stop = server_stop.clone();
                     let connection_running = Arc::clone(&listener_running);
                     std::thread::spawn(move || {
+                        let Some(peer_authority) =
+                            crate::platform::local_socket_peer_authority(&stream)
+                        else {
+                            warn!("dropping API connection after peer-authority cleanup failed");
+                            return;
+                        };
                         if let Err(err) = handle_connection_with_stop(
                             stream,
                             &api_tx,
@@ -112,6 +119,7 @@ fn start_server_inner(
                             &connection_running,
                             capabilities,
                             server_stop.as_ref(),
+                            peer_authority,
                         ) {
                             warn!(err = %err, "api connection failed");
                         }
@@ -155,7 +163,15 @@ fn handle_connection(
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
 ) -> std::io::Result<()> {
-    handle_connection_with_stop(stream, api_tx, event_hub, running, capabilities, None)
+    handle_connection_with_stop(
+        stream,
+        api_tx,
+        event_hub,
+        running,
+        capabilities,
+        None,
+        crate::platform::PeerAuthority::Owner,
+    )
 }
 
 fn handle_connection_with_stop(
@@ -165,6 +181,7 @@ fn handle_connection_with_stop(
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
     server_stop: Option<&Arc<AtomicBool>>,
+    peer_authority: crate::platform::PeerAuthority,
 ) -> std::io::Result<()> {
     if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
         debug!(err = %err, "api connection write timeout unavailable");
@@ -200,6 +217,20 @@ fn handle_connection_with_stop(
     let method = api_method_name(&request.method);
     let changes_ui = request_changes_ui(&request);
     crate::logging::api_request_started(&request_id, method, changes_ui);
+
+    if let Some(operation) = run_socket_operation(&request.method) {
+        if crate::platform::assert_run_peer_authority(peer_authority, operation).is_err() {
+            let error = RunError::Unauthorized;
+            let response = error_response_json(request_id.clone(), error.code(), error.message());
+            return finish_wait_response(
+                &mut stream,
+                Some(response),
+                &request_id,
+                method,
+                changes_ui,
+            );
+        }
+    }
 
     match request.method {
         Method::PaneGraphicsStream(params) => {
@@ -308,6 +339,16 @@ fn handle_connection_with_stop(
     }
 }
 
+fn run_socket_operation(method: &Method) -> Option<crate::platform::RunSocketOperation> {
+    match method {
+        Method::RunCapabilityIssue(_) => Some(crate::platform::RunSocketOperation::CapabilityIssue),
+        Method::RunSubmit(_) => Some(crate::platform::RunSocketOperation::Submit),
+        Method::RunStatus(_) => Some(crate::platform::RunSocketOperation::Status),
+        Method::RunCancel(_) => Some(crate::platform::RunSocketOperation::Cancel),
+        _ => None,
+    }
+}
+
 fn finish_wait_response(
     stream: &mut LocalStream,
     response: Option<String>,
@@ -391,6 +432,10 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::ClientWindowTitleSet(_) => "client.window_title.set",
         Method::ClientWindowTitleClear(_) => "client.window_title.clear",
         Method::SessionSnapshot(_) => "session.snapshot",
+        Method::RunCapabilityIssue(_) => "run.capability.issue",
+        Method::RunSubmit(_) => "run.submit",
+        Method::RunStatus(_) => "run.status",
+        Method::RunCancel(_) => "run.cancel",
         Method::WorkspaceCreate(_) => "workspace.create",
         Method::WorkspaceList(_) => "workspace.list",
         Method::WorkspaceGet(_) => "workspace.get",
@@ -986,6 +1031,95 @@ mod tests {
             }
         });
         (api_tx, responder)
+    }
+
+    #[test]
+    fn run_capability_issue_crosses_the_json_socket_boundary() {
+        let (mut client, server, path) = local_stream_pair("run-capability-issue");
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let workspace = crate::workspace::Workspace::test_new("run-api");
+        let workspace_id = workspace.id.clone();
+        let registry_path = unique_test_path("run-capability-registry");
+        let responder_registry_path = registry_path.clone();
+        let responder = std::thread::spawn(move || {
+            let message = api_rx.blocking_recv().expect("socket dispatch");
+            assert!(matches!(
+                message.request.method,
+                Method::RunCapabilityIssue(_)
+            ));
+            let (_app_tx, app_rx) = mpsc::unbounded_channel();
+            let mut app = crate::app::App::new(
+                &crate::config::Config::default(),
+                true,
+                None,
+                app_rx,
+                EventHub::default(),
+            );
+            app.state.workspaces = vec![workspace];
+            app.set_run_registry_path_for_test(responder_registry_path);
+            message
+                .respond_to
+                .send(app.handle_api_request(message.request))
+                .expect("app response");
+        });
+        let running = Arc::new(AtomicBool::new(true));
+        let connection = std::thread::spawn(move || {
+            handle_connection(server, &api_tx, &EventHub::default(), &running, None)
+        });
+
+        let request = format!(
+            r#"{{"id":"socket-run","method":"run.capability.issue","params":{{"workspace_id":"{workspace_id}","ttl_ms":60000,"operations":["submit"]}}}}"#
+        );
+        client.write_all(request.as_bytes()).unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+        let response: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
+        assert_eq!(response["id"], "socket-run");
+        assert_eq!(response["result"]["type"], "run_capability_issued");
+        connection.join().unwrap().unwrap();
+        responder.join().unwrap();
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn foreign_and_unknown_peers_fail_before_run_dispatch() {
+        for peer in [
+            crate::platform::PeerAuthority::OtherUser,
+            crate::platform::PeerAuthority::Unknown,
+        ] {
+            let (mut client, server, path) = local_stream_pair("run-peer-authority");
+            let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+            let running = Arc::new(AtomicBool::new(true));
+            let connection = std::thread::spawn(move || {
+                handle_connection_with_stop(
+                    server,
+                    &api_tx,
+                    &EventHub::default(),
+                    &running,
+                    None,
+                    None,
+                    peer,
+                )
+            });
+            client
+                .write_all(br#"{"id":"peer-run","method":"run.status","params":{"capability":{"capability_id":"cap_1","sequence":1},"run_id":"run_1"}}"#)
+                .unwrap();
+            client.write_all(b"\n").unwrap();
+            client.flush().unwrap();
+            let response: serde_json::Value =
+                serde_json::from_str(&read_line(&mut client)).unwrap();
+            assert_eq!(response["id"], "peer-run");
+            let expected = RunError::Unauthorized;
+            assert_eq!(response["error"]["code"], expected.code());
+            assert_eq!(response["error"]["message"], expected.message());
+            assert!(
+                api_rx.try_recv().is_err(),
+                "a rejected peer must not reach the app"
+            );
+            connection.join().unwrap().unwrap();
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[test]
