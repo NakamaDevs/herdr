@@ -178,6 +178,39 @@ pub struct AgentPromptParams {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait: Option<AgentPromptWaitOptions>,
+    /// Whether to submit the prompt with Enter after the text. Defaults to true.
+    /// When false, the text is sent with the same readiness guards and encoding
+    /// and no Enter is scheduled. The request is rejected with
+    /// `agent_prompt_submit_pending` while the pane still has a delayed Enter
+    /// from an earlier prompt, and `wait` is rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submit: Option<bool>,
+}
+
+impl AgentPromptParams {
+    pub fn submit(&self) -> bool {
+        self.submit.unwrap_or(true)
+    }
+
+    /// Validate option combinations that need no target or agent state.
+    /// Callers must run this before any target lookup.
+    pub fn validate_options(&self) -> Result<(), super::response::ErrorBody> {
+        if self.text.is_empty() {
+            return Err(super::response::ErrorBody {
+                code: "empty_agent_prompt".into(),
+                message: "agent prompt must not be empty".into(),
+            });
+        }
+        if !self.submit() && self.wait.is_some() {
+            return Err(super::response::ErrorBody {
+                code: "agent_prompt_wait_requires_submit".into(),
+                message:
+                    "agent prompt wait requires submit; submit=false stages text without Enter"
+                        .into(),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

@@ -87,13 +87,31 @@ fn agent_start_and_prompt_requests_round_trip() {
             target: "reviewer".into(),
             text: "review this".into(),
             wait: None,
+            submit: None,
         }),
     };
     let prompt_json = serde_json::to_value(&prompt).unwrap();
     assert_eq!(prompt_json["method"], "agent.prompt");
+    assert!(prompt_json["params"].get("submit").is_none());
     assert_eq!(
         serde_json::from_value::<Request>(prompt_json).unwrap(),
         prompt
+    );
+
+    let staged_prompt = Request {
+        id: "prompt-staged".into(),
+        method: Method::AgentPrompt(AgentPromptParams {
+            target: "reviewer".into(),
+            text: "review this".into(),
+            wait: None,
+            submit: Some(false),
+        }),
+    };
+    let staged_prompt_json = serde_json::to_value(&staged_prompt).unwrap();
+    assert_eq!(staged_prompt_json["params"]["submit"], false);
+    assert_eq!(
+        serde_json::from_value::<Request>(staged_prompt_json).unwrap(),
+        staged_prompt
     );
 
     let prompt_and_wait = Request {
@@ -105,6 +123,7 @@ fn agent_start_and_prompt_requests_round_trip() {
                 until: vec![AgentStatus::Idle, AgentStatus::Done],
                 timeout_ms: Some(120_000),
             }),
+            submit: None,
         }),
     };
     let prompt_and_wait_json = serde_json::to_value(&prompt_and_wait).unwrap();

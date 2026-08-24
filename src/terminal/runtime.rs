@@ -462,6 +462,10 @@ impl TerminalRuntime {
         self.0.send_bytes_after(bytes, delay);
     }
 
+    pub fn pending_delayed_input_count(&self) -> usize {
+        self.0.pending_delayed_input_count()
+    }
+
     pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {
         self.0.send_paste(text).await
     }
