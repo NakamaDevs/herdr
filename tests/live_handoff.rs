@@ -1229,7 +1229,7 @@ fn live_handoff_keeps_unmanaged_agent_name_bound_to_saved_session() {
     fs::write(
         &fake_pi,
         format!(
-            "#!/bin/sh\nexport HERDR_AGENT=pi\necho started > {}\nexec /bin/sleep 30\n",
+            "#!/bin/sh\nexport HERDR_AGENT=pi\necho started > {}\n/bin/sleep 30\n",
             started_marker.display()
         ),
     )
@@ -1291,7 +1291,7 @@ fn live_handoff_keeps_unmanaged_agent_name_bound_to_saved_session() {
         }),
     ));
     let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
+    let detected = loop {
         let response = request(
             &api_socket,
             serde_json::json!({
@@ -1301,14 +1301,19 @@ fn live_handoff_keeps_unmanaged_agent_name_bound_to_saved_session() {
             }),
         );
         if response.get("result").is_some() {
-            break;
+            break response;
         }
         assert!(
             Instant::now() < deadline,
-            "agent process was not detected: {response}"
+            "fixture process detection failed before live handoff: {response}"
         );
         thread::sleep(Duration::from_millis(25));
-    }
+    };
+    assert_eq!(
+        detected["result"]["agent"]["agent"].as_str(),
+        Some("pi"),
+        "fixture detection returned an unexpected agent: {detected}"
+    );
     assert_ok(request(
         &api_socket,
         serde_json::json!({
@@ -1318,12 +1323,30 @@ fn live_handoff_keeps_unmanaged_agent_name_bound_to_saved_session() {
         }),
     ));
 
-    assert_ok(request(
+    let handoff = request(
         &api_socket,
         serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
-    ));
+    );
+    assert!(
+        handoff.get("result").is_some(),
+        "live handoff API failed after fixture detection: {handoff}"
+    );
     drop(spawned);
     wait_for_api(&api_socket, Duration::from_secs(10));
+
+    let restored = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:agent:restored",
+            "method": "agent.get",
+            "params": {"target": pane_id}
+        }),
+    );
+    assert_eq!(
+        restored["result"]["agent"]["agent"].as_str(),
+        Some("pi"),
+        "live handoff API did not restore the detected fixture agent: {restored}"
+    );
 
     assert_ok(request(
         &api_socket,
