@@ -498,6 +498,9 @@ fn restore_tab(
         let saved_agent_occupant_generation = saved_pane
             .map(|pane| pane.agent_occupant_generation)
             .unwrap_or(0);
+        let saved_agent_occupant_generation_unconfirmed = saved_pane
+            .map(|pane| pane.agent_occupant_generation_unconfirmed)
+            .unwrap_or(false);
         let saved_launch_argv = saved_pane.and_then(|p| p.launch_argv.clone());
         let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
         let saved_history =
@@ -541,6 +544,9 @@ fn restore_tab(
             let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
                 .with_pending_agent_resume_plan(plan);
             terminal.restore_agent_occupant_generation(saved_agent_occupant_generation);
+            terminal.restore_agent_occupant_generation_unconfirmed(
+                saved_agent_occupant_generation_unconfirmed,
+            );
             if let Some(label) = saved_label {
                 terminal.set_manual_label(label);
             }
@@ -634,6 +640,9 @@ fn restore_tab(
                 let terminal_id = TerminalId::alloc();
                 let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone());
                 terminal.restore_agent_occupant_generation(saved_agent_occupant_generation);
+                terminal.restore_agent_occupant_generation_unconfirmed(
+                    saved_agent_occupant_generation_unconfirmed,
+                );
                 if was_imported {
                     if let Some(argv) = saved_launch_argv {
                         terminal = terminal.with_launch_argv(argv).with_respawn_shell_on_exit();
@@ -1204,6 +1213,7 @@ mod tests {
                             }),
                             launch_argv: None,
                             agent_occupant_generation: 0,
+                            agent_occupant_generation_unconfirmed: false,
                         },
                     )]),
                     zoomed: false,
@@ -1280,6 +1290,7 @@ mod tests {
                             agent_session: None,
                             launch_argv: None,
                             agent_occupant_generation: 7,
+                            agent_occupant_generation_unconfirmed: false,
                         },
                     )]),
                     zoomed: false,
@@ -1322,6 +1333,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_preserves_exhausted_unconfirmed_generation_across_restart() {
+        let cwd = std::env::current_dir().unwrap();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd,
+                            label: None,
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: None,
+                            launch_argv: None,
+                            agent_occupant_generation: u64::MAX,
+                            agent_occupant_generation_unconfirmed: true,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (_workspaces, terminals, _runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let mut terminal = terminals
+            .into_values()
+            .next()
+            .expect("restored terminal should exist");
+        assert!(
+            terminal.agent_occupant_generation_unconfirmed(),
+            "a pane already exhausted-and-unconfirmed before restart must not silently \
+             forget that fact after a restore"
+        );
+
+        terminal
+            .set_detected_agent_process_at(crate::detect::Agent::Codex, std::time::Instant::now());
+
+        assert!(
+            !terminal.is_agent_terminal(),
+            "a fresh detector-driven occupant must not be exposed as valid on a restored \
+             pane whose generation was already exhausted-and-unconfirmed before restart"
+        );
+    }
+
+    #[tokio::test]
     async fn restore_preserves_public_id_mapping_after_pane_id_remap() {
         let cwd = std::env::current_dir().unwrap();
         let snapshot = SessionSnapshot {
@@ -1354,6 +1443,7 @@ mod tests {
                                 agent_session: None,
                                 launch_argv: None,
                                 agent_occupant_generation: 0,
+                                agent_occupant_generation_unconfirmed: false,
                             },
                         ),
                         (
@@ -1366,6 +1456,7 @@ mod tests {
                                 agent_session: None,
                                 launch_argv: None,
                                 agent_occupant_generation: 0,
+                                agent_occupant_generation_unconfirmed: false,
                             },
                         ),
                     ]),
@@ -1420,6 +1511,7 @@ mod tests {
                     agent_session: None,
                     launch_argv: None,
                     agent_occupant_generation: 0,
+                    agent_occupant_generation_unconfirmed: false,
                 },
             )
         };
@@ -1436,6 +1528,7 @@ mod tests {
             }),
             launch_argv: None,
             agent_occupant_generation: 0,
+            agent_occupant_generation_unconfirmed: false,
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -1588,6 +1681,7 @@ mod tests {
                             }),
                             launch_argv: None,
                             agent_occupant_generation: 0,
+                            agent_occupant_generation_unconfirmed: false,
                         },
                     )]),
                     zoomed: false,
@@ -1750,6 +1844,7 @@ mod tests {
                 agent_session: None,
                 launch_argv: None,
                 agent_occupant_generation: 0,
+                agent_occupant_generation_unconfirmed: false,
             },
         );
         let history = SessionHistorySnapshot {

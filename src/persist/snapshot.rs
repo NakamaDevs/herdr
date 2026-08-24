@@ -109,6 +109,8 @@ pub struct PaneSnapshot {
     pub launch_argv: Option<Vec<String>>,
     #[serde(default)]
     pub agent_occupant_generation: u64,
+    #[serde(default)]
+    pub agent_occupant_generation_unconfirmed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,6 +344,9 @@ fn capture_tab(
         let agent_occupant_generation = terminal
             .map(|terminal| terminal.agent_occupant_generation)
             .unwrap_or(0);
+        let agent_occupant_generation_unconfirmed = terminal
+            .map(|terminal| terminal.agent_occupant_generation_unconfirmed())
+            .unwrap_or(false);
         let launch_argv = terminal.and_then(|terminal| terminal.launch_argv.clone());
         let agent_session = terminal.and_then(|terminal| {
             if let Some(authority) = terminal.hook_authority.as_ref() {
@@ -374,6 +379,7 @@ fn capture_tab(
                 agent_session,
                 launch_argv,
                 agent_occupant_generation,
+                agent_occupant_generation_unconfirmed,
             },
         );
     }
@@ -655,6 +661,7 @@ mod tests {
                 agent_session: None,
                 launch_argv: None,
                 agent_occupant_generation: 0,
+                agent_occupant_generation_unconfirmed: false,
             },
         );
         panes.insert(
@@ -667,6 +674,7 @@ mod tests {
                 agent_session: None,
                 launch_argv: None,
                 agent_occupant_generation: 0,
+                agent_occupant_generation_unconfirmed: false,
             },
         );
 
@@ -1216,6 +1224,7 @@ mod tests {
                 agent_session: None,
                 launch_argv: None,
                 agent_occupant_generation: 0,
+                agent_occupant_generation_unconfirmed: false,
             },
         );
         panes.insert(
@@ -1230,6 +1239,7 @@ mod tests {
                 agent_session: None,
                 launch_argv: None,
                 agent_occupant_generation: 0,
+                agent_occupant_generation_unconfirmed: false,
             },
         );
 

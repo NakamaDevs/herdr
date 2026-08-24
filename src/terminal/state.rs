@@ -139,6 +139,16 @@ pub struct TerminalState {
     /// callers can prove the agent process they started is still the one
     /// occupying the pane, even if `agent_name` is reused by a later occupant.
     pub agent_occupant_generation: u64,
+    /// Set when a release (`clear_agent_name`) could not mint a fresh
+    /// generation because the counter is exhausted at `u64::MAX`. While this
+    /// is set, no occupant may be exposed as present through
+    /// `effective_agent_label`/`is_agent_terminal` — screen detection or a
+    /// legacy hook authority report could otherwise surface a genuinely
+    /// different occupant under the departed occupant's stale generation.
+    /// Cleared only when a generation-guarded transition
+    /// (`begin_managed_agent` or an accepted SessionStart replacement)
+    /// successfully mints a fresh generation again.
+    agent_occupant_generation_unconfirmed: bool,
     hook_report_sequences: HashMap<String, u64>,
     suppressed_full_lifecycle_hook_reports: HashMap<String, SuppressedFullLifecycleHookReport>,
     stale_full_lifecycle_hook_sessions: HashMap<String, Vec<StaleFullLifecycleHookSession>>,
@@ -174,6 +184,7 @@ impl TerminalState {
             agent_name_owner: None,
             managed_agent: None,
             agent_occupant_generation: 0,
+            agent_occupant_generation_unconfirmed: false,
             hook_report_sequences: HashMap::new(),
             suppressed_full_lifecycle_hook_reports: HashMap::new(),
             stale_full_lifecycle_hook_sessions: HashMap::new(),
@@ -1614,8 +1625,8 @@ impl TerminalState {
         });
         let current_session = self.current_session_identity_for_persistence();
         let session_ref_changed = previous_session != current_session;
-        if session_ref_changed {
-            self.bump_agent_occupant_generation();
+        if session_ref_changed && self.bump_agent_occupant_generation() {
+            self.agent_occupant_generation_unconfirmed = false;
         }
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
@@ -1820,6 +1831,9 @@ impl TerminalState {
     }
 
     pub fn effective_agent_label(&self) -> Option<&str> {
+        if self.agent_occupant_generation_unconfirmed {
+            return None;
+        }
         self.hook_authority
             .as_ref()
             .filter(|authority| self.hook_authority_is_effective(authority))
@@ -1933,6 +1947,7 @@ impl TerminalState {
         if !self.bump_agent_occupant_generation() {
             return false;
         }
+        self.agent_occupant_generation_unconfirmed = false;
         self.set_agent_name(name);
         self.agent_name_owner = Some(AgentNameOwner {
             agent_label: crate::detect::agent_label(kind).to_string(),
@@ -2082,6 +2097,18 @@ impl TerminalState {
         self.agent_occupant_generation = generation;
     }
 
+    /// Restores whether this pane's occupant generation was already
+    /// exhausted-and-unconfirmed before a restart, so a restored snapshot
+    /// can't silently forget that fact and let a fresh detector-driven
+    /// occupant be exposed as valid afterward.
+    pub fn restore_agent_occupant_generation_unconfirmed(&mut self, unconfirmed: bool) {
+        self.agent_occupant_generation_unconfirmed = unconfirmed;
+    }
+
+    pub fn agent_occupant_generation_unconfirmed(&self) -> bool {
+        self.agent_occupant_generation_unconfirmed
+    }
+
     /// Advances the occupant generation to a value no prior occupant has ever
     /// held. Returns `false` without changing the counter when it is already
     /// at `u64::MAX` — there is no larger value left to mint, so a caller
@@ -2101,10 +2128,15 @@ impl TerminalState {
         self.agent_name = None;
         self.agent_name_owner = None;
         self.managed_agent = None;
-        // Releasing to "vacant" does not need a fresh identity distinct from
-        // future occupants, only from the outgoing one, so exhaustion here is
-        // best-effort rather than fail-closed like begin_managed_agent.
-        let _ = self.bump_agent_occupant_generation();
+        // Releasing to "vacant" cannot refuse to happen -- the process really
+        // did exit -- so exhaustion here can't fail the release itself. When
+        // it can't mint a fresh generation, mark the pane unconfirmed instead
+        // so no later occupant (including one recognized only through screen
+        // detection or a legacy hook authority report, neither of which is
+        // generation-guarded) can be exposed under the stale value.
+        if !self.bump_agent_occupant_generation() {
+            self.agent_occupant_generation_unconfirmed = true;
+        }
     }
 
     pub fn clear_agent_runtime_identity_after_respawn(&mut self) {
@@ -2535,6 +2567,65 @@ mod tests {
             terminal.managed_agent_kind().is_none(),
             "a refused start must not leave a half-established managed agent behind"
         );
+    }
+
+    #[test]
+    fn detector_driven_acquisition_after_exhausted_release_fails_closed() {
+        let mut terminal = test_terminal();
+        terminal.restore_agent_occupant_generation(u64::MAX - 1);
+        let now = Instant::now();
+
+        let started = terminal.begin_managed_agent(
+            "reviewer".into(),
+            Agent::Pi,
+            now,
+            Duration::ZERO,
+            Duration::from_secs(30),
+        );
+        assert!(
+            started,
+            "setup: starting one more occupant right before exhaustion must still succeed"
+        );
+        assert_eq!(terminal.agent_occupant_generation, u64::MAX);
+
+        terminal.clear_agent_name();
+        assert_eq!(
+            terminal.agent_occupant_generation,
+            u64::MAX,
+            "release at exhaustion cannot mint a fresh generation"
+        );
+
+        // A genuinely different occupant now takes over the pane through pure
+        // screen/process detection -- the same real path AgentProcessDetected
+        // uses -- entirely outside begin_managed_agent/SessionStart.
+        terminal.set_detected_agent_process_at(Agent::Codex, now);
+
+        assert!(
+            !terminal.is_agent_terminal(),
+            "a detector-only occupant taking over an exhausted, just-vacated pane must not \
+             be exposed as a valid occupant -- it would be indistinguishable from the \
+             departed occupant under the stale u64::MAX generation"
+        );
+        assert!(
+            terminal.effective_agent_label().is_none(),
+            "effective_agent_label must not report the new detector-only occupant while the \
+             generation is exhausted and unconfirmed"
+        );
+    }
+
+    #[test]
+    fn detector_driven_acquisition_still_works_when_generation_is_not_exhausted() {
+        let mut terminal = test_terminal();
+        let now = Instant::now();
+
+        terminal.set_detected_agent_process_at(Agent::Codex, now);
+
+        assert!(
+            terminal.is_agent_terminal(),
+            "ordinary detector-only acquisition on a pane with room left in its generation \
+             counter must continue to work exactly as before"
+        );
+        assert_eq!(terminal.effective_known_agent(), Some(Agent::Codex));
     }
 
     #[test]
