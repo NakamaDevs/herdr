@@ -897,7 +897,7 @@ mod tests {
             .clone();
         let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
         let now = std::time::Instant::now();
-        terminal.begin_managed_agent(
+        let _ = terminal.begin_managed_agent(
             "reviewer".into(),
             Agent::OpenCode,
             now,
@@ -984,5 +984,125 @@ mod tests {
                 Some("shell-pane")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn agent_start_and_get_expose_a_consistent_agent_occupant_generation() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let (runtime, _rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80, 24, 0, b"", 1,
+            );
+        app.terminal_runtimes.insert(terminal_id, runtime);
+        let target = app.public_pane_id(0, pane_id).unwrap();
+
+        let response = app.handle_agent_start(
+            "start".into(),
+            AgentStartParams {
+                name: "reviewer".into(),
+                kind: "pi".into(),
+                pane_id: target,
+                args: Vec::new(),
+                timeout_ms: None,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentStarted { agent, .. } = success.result else {
+            panic!("expected agent_started response");
+        };
+        assert!(
+            agent.agent_occupant_generation >= 1,
+            "starting a fresh occupant should allocate a new occupant generation, got {}",
+            agent.agent_occupant_generation
+        );
+        let start_generation = agent.agent_occupant_generation;
+
+        let get_response = app.handle_agent_get(
+            "get".into(),
+            AgentTarget {
+                target: "reviewer".into(),
+            },
+        );
+        let get_success: SuccessResponse = serde_json::from_str(&get_response).unwrap();
+        let ResponseResult::AgentInfo { agent: fetched } = get_success.result else {
+            panic!("expected agent_info response");
+        };
+        assert_eq!(
+            fetched.agent_occupant_generation, start_generation,
+            "agent.get must report the same occupant generation as agent.start for the same occupant"
+        );
+    }
+
+    #[test]
+    fn ordinary_transitions_leave_agent_occupant_generation_unchanged() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        let generation = terminal.agent_occupant_generation;
+        let target = app.public_pane_id(0, pane_id).unwrap();
+
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(Some(Agent::Pi), AgentState::Working);
+        assert_eq!(
+            app.state.terminals[&terminal_id].agent_occupant_generation, generation,
+            "an ordinary state transition must not change the occupant generation"
+        );
+
+        let focus_response = app.handle_agent_focus(
+            "focus".into(),
+            AgentTarget {
+                target: target.clone(),
+            },
+        );
+        assert!(matches!(
+            serde_json::from_str::<SuccessResponse>(&focus_response)
+                .unwrap()
+                .result,
+            ResponseResult::AgentInfo { .. }
+        ));
+        assert_eq!(
+            app.state.terminals[&terminal_id].agent_occupant_generation, generation,
+            "a focus change must not change the occupant generation"
+        );
+
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_terminal_title(Some("reviewer - pi".into()));
+        assert_eq!(
+            app.state.terminals[&terminal_id].agent_occupant_generation, generation,
+            "a title change must not change the occupant generation"
+        );
+
+        let rename_response = app.handle_agent_rename(
+            "rename".into(),
+            AgentRenameParams {
+                target,
+                name: Some("reviewer-renamed".into()),
+            },
+        );
+        assert!(matches!(
+            serde_json::from_str::<SuccessResponse>(&rename_response)
+                .unwrap()
+                .result,
+            ResponseResult::AgentInfo { .. }
+        ));
+        assert_eq!(
+            app.state.terminals[&terminal_id].agent_occupant_generation, generation,
+            "renaming the same occupant must not change the occupant generation"
+        );
     }
 }

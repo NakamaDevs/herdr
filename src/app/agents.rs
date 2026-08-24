@@ -212,7 +212,10 @@ impl App {
             .terminals
             .get_mut(&terminal_id)
             .ok_or_else(|| AgentStartError::TargetUnavailable(params.pane_id.clone()))?;
-        terminal.begin_managed_agent(name.clone(), kind, now, AGENT_START_SETTLE_DELAY, timeout);
+        if !terminal.begin_managed_agent(name.clone(), kind, now, AGENT_START_SETTLE_DELAY, timeout)
+        {
+            return Err(AgentStartError::OccupantGenerationExhausted(params.pane_id));
+        }
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
             terminal.clear_agent_name();
             return Err(AgentStartError::InputFailed(err.to_string()));
@@ -282,6 +285,15 @@ impl App {
                         .join("; ")
                 ),
             },
+            AgentStartError::OccupantGenerationExhausted(target) => {
+                crate::api::schema::ErrorBody {
+                    code: "agent_occupant_generation_exhausted".into(),
+                    message: format!(
+                        "agent target pane {target} cannot start a new occupant: its occupant \
+                         generation counter is exhausted"
+                    ),
+                }
+            }
         }
     }
 
@@ -390,6 +402,7 @@ impl App {
             launch_pending: terminal.managed_agent_launch_pending(),
             interactive_ready: terminal.managed_agent_interactive_ready(),
             state_change_seq: terminal.last_agent_state_change_seq.unwrap_or(0),
+            agent_occupant_generation: terminal.agent_occupant_generation,
             cwd: pane.cwd,
             foreground_cwd: pane.foreground_cwd,
             revision: pane.revision,
@@ -453,6 +466,7 @@ pub(super) enum AgentStartError {
         name: String,
         candidates: Vec<crate::api::schema::AgentInfo>,
     },
+    OccupantGenerationExhausted(String),
 }
 
 pub(super) enum AgentRenameError {

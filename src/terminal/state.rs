@@ -133,6 +133,12 @@ pub struct TerminalState {
     pub agent_name: Option<String>,
     agent_name_owner: Option<AgentNameOwner>,
     managed_agent: Option<ManagedAgent>,
+    /// Monotonic identity counter for whichever occupant currently holds this
+    /// pane. It changes only when the occupant itself changes (process exit,
+    /// explicit release, or an accepted replacement occupant taking over) so
+    /// callers can prove the agent process they started is still the one
+    /// occupying the pane, even if `agent_name` is reused by a later occupant.
+    pub agent_occupant_generation: u64,
     hook_report_sequences: HashMap<String, u64>,
     suppressed_full_lifecycle_hook_reports: HashMap<String, SuppressedFullLifecycleHookReport>,
     stale_full_lifecycle_hook_sessions: HashMap<String, Vec<StaleFullLifecycleHookSession>>,
@@ -167,6 +173,7 @@ impl TerminalState {
             agent_name: None,
             agent_name_owner: None,
             managed_agent: None,
+            agent_occupant_generation: 0,
             hook_report_sequences: HashMap::new(),
             suppressed_full_lifecycle_hook_reports: HashMap::new(),
             stale_full_lifecycle_hook_sessions: HashMap::new(),
@@ -1570,6 +1577,19 @@ impl TerminalState {
         let previous_state = self.state;
         let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
         let previous_session = self.current_session_identity_for_persistence();
+        let candidate_session = Some((
+            source.clone(),
+            agent_label.clone(),
+            session_ref.kind,
+            session_ref.value.clone(),
+        ));
+        if previous_session != candidate_session && self.agent_occupant_generation == u64::MAX {
+            // A different occupant is trying to take over this pane, but the
+            // generation counter is exhausted and cannot mint a fresh,
+            // non-reused identity. Refuse the replacement rather than accept
+            // it under the previous occupant's generation.
+            return None;
+        }
         if session_replacement_allowed || foreground_takeover_allowed {
             self.forget_stale_full_lifecycle_hook_session(&source, &agent_label, &session_ref);
         }
@@ -1593,6 +1613,10 @@ impl TerminalState {
             session_ref,
         });
         let current_session = self.current_session_identity_for_persistence();
+        let session_ref_changed = previous_session != current_session;
+        if session_ref_changed {
+            self.bump_agent_occupant_generation();
+        }
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
                 previous_agent_label,
@@ -1601,7 +1625,7 @@ impl TerminalState {
                 previous_presentation,
                 now,
             ),
-            session_ref_changed: previous_session != current_session,
+            session_ref_changed,
             agent_released: false,
         })
     }
@@ -1893,6 +1917,11 @@ impl TerminalState {
         });
     }
 
+    /// Starts a new managed-agent occupant. Returns `false` and leaves the
+    /// terminal untouched when the occupant generation counter is exhausted,
+    /// since starting anyway would give the new occupant the same identity
+    /// value the previous occupant already reported as its own.
+    #[must_use]
     pub fn begin_managed_agent(
         &mut self,
         name: String,
@@ -1900,7 +1929,10 @@ impl TerminalState {
         now: Instant,
         settle_delay: Duration,
         timeout: Duration,
-    ) {
+    ) -> bool {
+        if !self.bump_agent_occupant_generation() {
+            return false;
+        }
         self.set_agent_name(name);
         self.agent_name_owner = Some(AgentNameOwner {
             agent_label: crate::detect::agent_label(kind).to_string(),
@@ -1914,6 +1946,7 @@ impl TerminalState {
                 observed_expected: false,
             },
         });
+        true
     }
 
     pub fn managed_agent_launch_pending(&self) -> bool {
@@ -2040,10 +2073,38 @@ impl TerminalState {
         });
     }
 
+    /// Sets the occupant generation to an exact previously-persisted value,
+    /// without bumping it. Only the session-snapshot restore path should call
+    /// this; every other caller that changes pane occupancy must go through
+    /// `bump_agent_occupant_generation` so the counter stays a true identity
+    /// marker for the current occupant.
+    pub fn restore_agent_occupant_generation(&mut self, generation: u64) {
+        self.agent_occupant_generation = generation;
+    }
+
+    /// Advances the occupant generation to a value no prior occupant has ever
+    /// held. Returns `false` without changing the counter when it is already
+    /// at `u64::MAX` — there is no larger value left to mint, so a caller
+    /// establishing a new occupant identity must treat that as a failure
+    /// rather than silently reusing the exhausted counter's last value.
+    fn bump_agent_occupant_generation(&mut self) -> bool {
+        match self.agent_occupant_generation.checked_add(1) {
+            Some(next) => {
+                self.agent_occupant_generation = next;
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn clear_agent_name(&mut self) {
         self.agent_name = None;
         self.agent_name_owner = None;
         self.managed_agent = None;
+        // Releasing to "vacant" does not need a fresh identity distinct from
+        // future occupants, only from the outgoing one, so exhaustion here is
+        // best-effort rather than fail-closed like begin_managed_agent.
+        let _ = self.bump_agent_occupant_generation();
     }
 
     pub fn clear_agent_runtime_identity_after_respawn(&mut self) {
@@ -2206,7 +2267,7 @@ mod tests {
     fn managed_agent_readiness_tracks_detection_state() {
         let mut terminal = test_terminal();
         let now = Instant::now();
-        terminal.begin_managed_agent(
+        let _ = terminal.begin_managed_agent(
             "reviewer".into(),
             Agent::Pi,
             now,
@@ -2246,10 +2307,241 @@ mod tests {
     }
 
     #[test]
+    fn process_exit_invalidates_agent_occupant_generation() {
+        let mut terminal = test_terminal();
+        let now = Instant::now();
+        let _ = terminal.begin_managed_agent(
+            "reviewer".into(),
+            Agent::Pi,
+            now,
+            Duration::ZERO,
+            Duration::from_secs(30),
+        );
+        let generation_before = terminal.agent_occupant_generation;
+
+        assert!(terminal.reconcile_managed_agent_at(now, true));
+
+        assert!(
+            terminal.agent_occupant_generation > generation_before,
+            "process exit should invalidate the occupant generation"
+        );
+    }
+
+    #[test]
+    fn explicit_release_invalidates_agent_occupant_generation() {
+        let mut terminal = test_terminal();
+        let now = Instant::now();
+        let _ = terminal.begin_managed_agent(
+            "reviewer".into(),
+            Agent::Pi,
+            now,
+            Duration::ZERO,
+            Duration::from_secs(30),
+        );
+        let generation_before = terminal.agent_occupant_generation;
+
+        terminal.clear_agent_name();
+
+        assert!(
+            terminal.agent_occupant_generation > generation_before,
+            "an explicit release should invalidate the occupant generation"
+        );
+    }
+
+    #[test]
+    fn accepted_different_session_start_replacement_invalidates_agent_occupant_generation() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Hermes), AgentState::Idle);
+        let first_ref = crate::agent_resume::AgentSessionRef::id("hermes-root").unwrap();
+        let first = terminal.set_agent_session_ref_for_session_start(
+            "herdr:hermes".into(),
+            "hermes".into(),
+            Some(first_ref),
+            Some(10),
+            Some("startup".into()),
+        );
+        assert!(
+            first.is_some(),
+            "the initial session start should be accepted"
+        );
+        let generation_before = terminal.agent_occupant_generation;
+
+        terminal.set_detected_state(Some(Agent::Hermes), AgentState::Working);
+        let replacement_ref =
+            crate::agent_resume::AgentSessionRef::id("hermes-replacement").unwrap();
+        let replacement = terminal.set_agent_session_ref_for_session_start(
+            "herdr:hermes".into(),
+            "hermes".into(),
+            Some(replacement_ref),
+            Some(11),
+            Some("startup".into()),
+        );
+
+        assert!(
+            replacement.is_some_and(|mutation| mutation.session_ref_changed),
+            "the replacement session start should be accepted as a session change"
+        );
+        assert!(
+            terminal.agent_occupant_generation > generation_before,
+            "an accepted, different SessionStart replacement should invalidate the occupant generation"
+        );
+    }
+
+    #[test]
+    fn repeated_report_of_same_session_does_not_change_agent_occupant_generation() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Hermes), AgentState::Idle);
+        let session_ref = crate::agent_resume::AgentSessionRef::id("hermes-root").unwrap();
+
+        let first = terminal.set_agent_session_ref_for_session_start(
+            "herdr:hermes".into(),
+            "hermes".into(),
+            Some(session_ref.clone()),
+            Some(10),
+            Some("startup".into()),
+        );
+        assert!(first.is_some());
+        let generation = terminal.agent_occupant_generation;
+
+        let repeated = terminal.set_agent_session_ref_for_session_start(
+            "herdr:hermes".into(),
+            "hermes".into(),
+            Some(session_ref),
+            Some(11),
+            Some("startup".into()),
+        );
+
+        assert!(
+            repeated.is_some_and(|mutation| !mutation.session_ref_changed),
+            "repeating the already-known session should not report a session change"
+        );
+        assert_eq!(
+            terminal.agent_occupant_generation, generation,
+            "an idempotent re-report of the same occupant must not bump the generation"
+        );
+    }
+
+    #[test]
+    fn same_name_replacement_does_not_reuse_the_old_agent_occupant_generation() {
+        let mut terminal = test_terminal();
+        let now = Instant::now();
+        let _ = terminal.begin_managed_agent(
+            "reviewer".into(),
+            Agent::Pi,
+            now,
+            Duration::ZERO,
+            Duration::from_secs(30),
+        );
+        let original_generation = terminal.agent_occupant_generation;
+
+        assert!(terminal.reconcile_managed_agent_at(now, true));
+        assert_eq!(terminal.agent_name, None);
+
+        let _ = terminal.begin_managed_agent(
+            "reviewer".into(),
+            Agent::Pi,
+            now,
+            Duration::ZERO,
+            Duration::from_secs(30),
+        );
+        assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
+
+        let replacement_generation = terminal.agent_occupant_generation;
+
+        assert_ne!(
+            replacement_generation, original_generation,
+            "a same-name replacement occupant must not reuse the previous occupant's generation"
+        );
+    }
+
+    #[test]
+    fn agent_occupant_generation_is_strictly_monotonic_across_a_lifecycle_sequence() {
+        let mut terminal = test_terminal();
+        let now = Instant::now();
+        let mut generations = vec![terminal.agent_occupant_generation];
+
+        let _ = terminal.begin_managed_agent(
+            "reviewer".into(),
+            Agent::Pi,
+            now,
+            Duration::ZERO,
+            Duration::from_secs(30),
+        );
+        generations.push(terminal.agent_occupant_generation);
+
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
+        generations.push(terminal.agent_occupant_generation);
+
+        assert!(terminal.reconcile_managed_agent_at(now, true));
+        generations.push(terminal.agent_occupant_generation);
+
+        let _ = terminal.begin_managed_agent(
+            "reviewer".into(),
+            Agent::Pi,
+            now,
+            Duration::ZERO,
+            Duration::from_secs(30),
+        );
+        generations.push(terminal.agent_occupant_generation);
+
+        terminal.clear_agent_name();
+        generations.push(terminal.agent_occupant_generation);
+
+        for window in generations.windows(2) {
+            assert!(
+                window[1] >= window[0],
+                "agent_occupant_generation must never decrease across a lifecycle: {generations:?}"
+            );
+        }
+
+        let distinct: std::collections::HashSet<u64> = generations.iter().copied().collect();
+        assert!(
+            distinct.len() >= 4,
+            "expected process exit, a new occupant, and an explicit release to each move \
+             the generation forward with no reuse, got {generations:?}"
+        );
+    }
+
+    #[test]
+    fn exhausted_agent_occupant_generation_fails_closed_instead_of_reusing_the_identity() {
+        let mut terminal = test_terminal();
+        terminal.restore_agent_occupant_generation(u64::MAX);
+        let now = Instant::now();
+
+        let started = terminal.begin_managed_agent(
+            "reviewer".into(),
+            Agent::Pi,
+            now,
+            Duration::ZERO,
+            Duration::from_secs(30),
+        );
+
+        assert!(
+            !started,
+            "an exhausted occupant-generation counter must refuse to start a new occupant \
+             rather than let it reuse the previous occupant's identity"
+        );
+        assert_eq!(
+            terminal.agent_occupant_generation,
+            u64::MAX,
+            "a refused start must not silently retain u64::MAX as if a fresh identity had \
+             been issued for the new occupant"
+        );
+        assert_eq!(
+            terminal.agent_name, None,
+            "a refused start must not establish a new occupant at all"
+        );
+        assert!(
+            terminal.managed_agent_kind().is_none(),
+            "a refused start must not leave a half-established managed agent behind"
+        );
+    }
+
+    #[test]
     fn managed_agent_mismatch_and_timeout_release_name() {
         let now = Instant::now();
         let mut mismatch = test_terminal();
-        mismatch.begin_managed_agent(
+        let _ = mismatch.begin_managed_agent(
             "reviewer".into(),
             Agent::Pi,
             now,
@@ -2262,7 +2554,7 @@ mod tests {
         assert_eq!(mismatch.managed_agent_kind(), None);
 
         let mut timed_out = test_terminal();
-        timed_out.begin_managed_agent(
+        let _ = timed_out.begin_managed_agent(
             "reviewer".into(),
             Agent::Pi,
             now,
@@ -4923,7 +5215,7 @@ mod tests {
     fn managed_agent_name_survives_native_session_replacement() {
         let mut terminal = test_terminal();
         let now = Instant::now();
-        terminal.begin_managed_agent(
+        let _ = terminal.begin_managed_agent(
             "reviewer".into(),
             Agent::OpenCode,
             now,

@@ -107,6 +107,8 @@ pub struct PaneSnapshot {
     pub agent_session: Option<PaneAgentSessionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_argv: Option<Vec<String>>,
+    #[serde(default)]
+    pub agent_occupant_generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -337,6 +339,9 @@ fn capture_tab(
                 )
             })
             .unwrap_or_default();
+        let agent_occupant_generation = terminal
+            .map(|terminal| terminal.agent_occupant_generation)
+            .unwrap_or(0);
         let launch_argv = terminal.and_then(|terminal| terminal.launch_argv.clone());
         let agent_session = terminal.and_then(|terminal| {
             if let Some(authority) = terminal.hook_authority.as_ref() {
@@ -368,6 +373,7 @@ fn capture_tab(
                 managed_agent_kind,
                 agent_session,
                 launch_argv,
+                agent_occupant_generation,
             },
         );
     }
@@ -566,7 +572,7 @@ mod tests {
             .attached_terminal_id
             .clone();
         let now = std::time::Instant::now();
-        state
+        let _ = state
             .terminals
             .get_mut(&terminal_id)
             .unwrap()
@@ -648,6 +654,7 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                agent_occupant_generation: 0,
             },
         );
         panes.insert(
@@ -659,6 +666,7 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                agent_occupant_generation: 0,
             },
         );
 
@@ -1207,6 +1215,7 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                agent_occupant_generation: 0,
             },
         );
         panes.insert(
@@ -1220,6 +1229,7 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                agent_occupant_generation: 0,
             },
         );
 

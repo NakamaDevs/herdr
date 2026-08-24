@@ -6125,6 +6125,12 @@
                 "null"
               ]
             },
+            "agent_occupant_generation": {
+              "default": 0,
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
             "agent_session": {
               "anyOf": [
                 {
