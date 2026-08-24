@@ -462,15 +462,18 @@ impl crate::app::App {
 
     pub(super) fn handle_run_cancel(&mut self, id: String, params: RunCancelParams) -> String {
         let now_unix = Self::run_now_unix();
-        // Phase 1: authorize (the capability sequence is burned here and
-        // stays burned regardless of what happens next) and validate that the
-        // run is cancellable, but do not commit the `CancelRequested`
-        // transition yet. Committing it before the interrupt is known to
-        // reach the pane would durably claim a cancellation that may never
-        // happen.
-        let mut authorized = self.run_registry.clone();
+        let previous_registry = self.run_registry.clone();
+        let mut pending = previous_registry.clone();
+        // Resolve everything needed to actually deliver the interrupt first
+        // (authorization, the target run's cancellability, the live pane,
+        // and the encoded Ctrl-C bytes), and only once delivery is truly
+        // about to be attempted, commit the `CancelRequested` transition into
+        // `pending`. An interrupt is a real-world action we cannot take
+        // back, so the durable record must already reflect the attempt
+        // before we make it -- not persisted afterward, where a failed save
+        // would leave a delivered interrupt with no durable trace of it.
         let prepared = (|| {
-            let scope = authorized.authorize(
+            let scope = pending.authorize(
                 &CapabilityRef {
                     capability_id: params.capability.capability_id.clone(),
                     sequence: params.capability.sequence,
@@ -478,35 +481,36 @@ impl crate::app::App {
                 RunOperation::Cancel,
                 now_unix,
             )?;
-            let record = authorized.get(&params.run_id, &scope)?.clone();
-            if record.state.is_terminal() || now_unix < record.updated_at_unix {
-                return Err(RunError::NotCancellable);
-            }
+            let record = pending.get(&params.run_id, &scope)?.clone();
             let requested = Self::record_requested_binding(&record)?;
             let target = self.live_run_target(&requested)?;
-            Ok::<_, RunError>((scope, target))
+            let Some(runtime) = self.lookup_runtime_sender(target.workspace_index, target.pane_id)
+            else {
+                return Err(RunError::TargetUnavailable);
+            };
+            let encoded =
+                match crate::app::api_helpers::encode_api_keys(runtime, &["ctrl+c".to_string()]) {
+                    Ok(mut keys) => keys.pop(),
+                    Err(_) => None,
+                };
+            let Some(encoded) = encoded else {
+                return Err(RunError::TargetUnavailable);
+            };
+            let run = pending.request_cancel(&params.run_id, &scope, now_unix)?;
+            Ok::<_, RunError>((run, target.workspace_index, target.pane_id, encoded))
         })();
-        if authorized != self.run_registry {
-            if let Err(error) = self.persist_run_registry(authorized) {
+        if pending != self.run_registry {
+            if let Err(error) = self.persist_run_registry(pending) {
                 return Self::run_error(id, error);
             }
         } else if self.run_registry_load_error.is_some() || self.run_registry_path.is_none() {
             return Self::run_error(id, RunError::PersistenceUnavailable);
         }
-        let (scope, target) = match prepared {
+        let (run, workspace_index, pane_id, encoded) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => return Self::run_error(id, error),
         };
-        let Some(runtime) = self.lookup_runtime_sender(target.workspace_index, target.pane_id)
-        else {
-            return Self::run_error(id, RunError::TargetUnavailable);
-        };
-        let encoded =
-            match crate::app::api_helpers::encode_api_keys(runtime, &["ctrl+c".to_string()]) {
-                Ok(mut keys) => keys.pop(),
-                Err(_) => None,
-            };
-        let Some(encoded) = encoded else {
+        let Some(runtime) = self.lookup_runtime_sender(workspace_index, pane_id) else {
             return Self::run_error(id, RunError::TargetUnavailable);
         };
         // Suppressing the scheduled Enter and sending the interrupt are
@@ -515,17 +519,17 @@ impl crate::app::App {
         // interrupt below can never be followed by a stray Enter.
         runtime.cancel_scheduled_run_input(&params.run_id);
         if runtime.try_send_bytes(Bytes::from(encoded)).is_err() {
+            // The interrupt never reached the pane: compensate by reverting
+            // the just-persisted `CancelRequested` so the durable record
+            // stays truthful and this run remains retryable instead of
+            // stuck claiming a cancellation nobody ever signalled.
+            if let Err(revert_error) = self.persist_run_registry(previous_registry) {
+                tracing::warn!(
+                    error_code = revert_error.code(),
+                    "failed to revert a durably-persisted cancellation after the interrupt write failed"
+                );
+            }
             return Self::run_error(id, RunError::TargetUnavailable);
-        }
-        // Phase 2: the interrupt was accepted for delivery, so it is now
-        // truthful and safe to commit `CancelRequested` durably.
-        let mut next = self.run_registry.clone();
-        let run = match next.request_cancel(&params.run_id, &scope, now_unix) {
-            Ok(run) => run,
-            Err(error) => return Self::run_error(id, error),
-        };
-        if let Err(error) = self.persist_run_registry(next) {
-            return Self::run_error(id, error);
         }
         Self::run_success(id, ResponseResult::RunCancelRequested { run })
     }
@@ -1773,6 +1777,11 @@ mod tests {
     // Defect: `CancelRequested` used to persist unconditionally before the
     // interrupt write was attempted, so a failed runtime write left a
     // durable record claiming a cancellation that never reached the pane.
+    // The fix commits `CancelRequested` durably before sending the
+    // interrupt (so a successful interrupt is never left unrecorded, see
+    // `cancel_persistence_failure_writes_no_interrupt` below) and reverts
+    // that persisted state again if the interrupt write itself then fails,
+    // which this test exercises end to end.
     #[tokio::test]
     async fn failed_interrupt_delivery_does_not_persist_cancel_requested_and_stays_retryable() {
         let temp = TempRegistry::new("cancel-interrupt-failure");
@@ -1822,6 +1831,81 @@ mod tests {
                 .request_cancel(&run.run_id, &retry_scope, after_updated_at_unix)
                 .is_ok(),
             "the run must remain retryable after a failed interrupt delivery"
+        );
+    }
+
+    // Defect: a successful interrupt write could still leave no durable
+    // cancellation record, because `CancelRequested` used to persist only
+    // after the interrupt was already sent -- if that persist then failed,
+    // the pane really was interrupted but the record never caught up, so a
+    // later status read could report the run as still running, blocked, or
+    // even succeeded. The fix commits `CancelRequested` durably first and
+    // only sends the interrupt once that is safely on disk, so persistence
+    // failure must leave the pane completely untouched.
+    #[tokio::test]
+    async fn cancel_persistence_failure_writes_no_interrupt() {
+        let temp = TempRegistry::new("cancel-save-failure");
+        let mut fixture = live_run_fixture(&temp);
+        let run = fixture.seed_run("cancel-save-failure", RunState::Running);
+        let capability = fixture.issue_capability(vec![RunOperation::Cancel]);
+        let blocked_parent = temp.directory.join("not-a-directory");
+        std::fs::write(&blocked_parent, b"block registry save").expect("blocked registry parent");
+        fixture.app.run_registry_path = Some(blocked_parent.join("runs.json"));
+
+        let cancelled = fixture.request(
+            "cancel",
+            Method::RunCancel(RunCancelParams {
+                capability,
+                run_id: run.run_id.clone(),
+            }),
+        );
+        assert_eq!(cancelled["error"]["code"], "run_persistence_unavailable");
+        assert!(
+            fixture
+                .prompt_rx
+                .as_mut()
+                .expect("fake runtime receiver")
+                .try_recv()
+                .is_err(),
+            "the interrupt must never be sent when the pending CancelRequested cannot be persisted"
+        );
+    }
+
+    // Direct ordering proof for the same defect: at the exact moment the
+    // interrupt bytes reach the runtime, the durable record must already
+    // show `CancelRequested`, not whatever state the run was in beforehand.
+    #[tokio::test]
+    async fn cancel_requested_is_already_durable_when_the_interrupt_is_sent() {
+        let temp = TempRegistry::new("cancel-durable-before-interrupt");
+        let observed_path = temp.path.clone();
+        let observed_state_at_send: Arc<std::sync::Mutex<Option<RunState>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let observed_state_for_observer = Arc::clone(&observed_state_at_send);
+        let mut fixture = live_run_fixture_with_input_observer(&temp, move |_bytes| {
+            let registry = crate::persist::run_registry::load_from_path(&observed_path)
+                .expect("registry readable when the interrupt is sent");
+            let state = registry
+                .records()
+                .first()
+                .expect("run record present when the interrupt is sent")
+                .state;
+            *observed_state_for_observer.lock().unwrap() = Some(state);
+        });
+        let run = fixture.seed_run("cancel-durable-before-interrupt", RunState::Running);
+        let capability = fixture.issue_capability(vec![RunOperation::Cancel]);
+
+        let cancelled = fixture.request(
+            "cancel",
+            Method::RunCancel(RunCancelParams {
+                capability,
+                run_id: run.run_id.clone(),
+            }),
+        );
+        assert_result_type(&cancelled, "run_cancel_requested");
+        assert_eq!(
+            *observed_state_at_send.lock().unwrap(),
+            Some(RunState::CancelRequested),
+            "CancelRequested must already be durable at the moment the interrupt is sent"
         );
     }
 
