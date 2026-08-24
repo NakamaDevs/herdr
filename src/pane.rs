@@ -1180,6 +1180,14 @@ impl PendingRunInput {
     /// resolve instead of racing ahead of it or re-sending it; the wait
     /// still happens before the caller disables further writes, so an
     /// already in-flight write can still land.
+    ///
+    /// A momentarily full command queue is retried (bounded): the actor
+    /// drains it continuously on its own dedicated thread, so a transient
+    /// full queue right at the handoff boundary is expected to clear within
+    /// milliseconds, and retrying here is the only chance this input gets
+    /// before the transport goes away for good. A closed transport (the
+    /// actor itself is gone) is not retried -- there is nothing left to
+    /// retry against.
     #[cfg(unix)]
     fn flush_before_handoff(&self, io: &PaneRuntimeIo) {
         let mut phase = self.lock_phase();
@@ -1188,7 +1196,7 @@ impl PendingRunInput {
                 RunInputPhase::Pending => {
                     *phase = RunInputPhase::Delivering;
                     drop(phase);
-                    match io.try_send_bytes(self.bytes.clone()) {
+                    match try_send_bytes_with_bounded_retry(io, self.bytes.clone()) {
                         Ok(()) => self.finish_delivery(),
                         Err(err) => {
                             error!(
@@ -1210,6 +1218,43 @@ impl PendingRunInput {
                     };
                 }
             }
+        }
+    }
+}
+
+/// Bounded attempt count for [`try_send_bytes_with_bounded_retry`]. The
+/// actor drains its command queue continuously on its own thread, so a
+/// queue that is transiently full at the handoff boundary is expected to
+/// have room again well within this budget.
+#[cfg(unix)]
+const HANDOFF_FLUSH_RETRY_ATTEMPTS: u32 = 40;
+/// Delay between attempts in [`try_send_bytes_with_bounded_retry`].
+#[cfg(unix)]
+const HANDOFF_FLUSH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Retry `io.try_send_bytes(bytes)` while the transport merely reports a
+/// full queue, up to a bounded attempt count. A closed transport is
+/// returned immediately: the actor itself is gone, so nothing is left to
+/// retry against.
+#[cfg(unix)]
+fn try_send_bytes_with_bounded_retry(
+    io: &PaneRuntimeIo,
+    bytes: Bytes,
+) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+    let mut bytes = bytes;
+    let mut attempts_remaining = HANDOFF_FLUSH_RETRY_ATTEMPTS;
+    loop {
+        match io.try_send_bytes(bytes) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::error::TrySendError::Full(returned)) => {
+                attempts_remaining -= 1;
+                if attempts_remaining == 0 {
+                    return Err(mpsc::error::TrySendError::Full(returned));
+                }
+                bytes = returned;
+                std::thread::sleep(HANDOFF_FLUSH_RETRY_DELAY);
+            }
+            Err(err) => return Err(err),
         }
     }
 }
@@ -3659,6 +3704,55 @@ mod tests {
             RunInputPhase::Undelivered,
             "a rejected write during handoff flush must not be recorded as delivered"
         );
+    }
+
+    /// Defect: a scheduled run input whose flush hit a merely-full (not
+    /// closed) queue right at the handoff boundary was permanently lost --
+    /// the phase became honestly `Undelivered`, but nothing ever retried or
+    /// recovered the byte, so it still never reached the pane. This exercises
+    /// the real handoff entry point (`preserve_for_handoff`) end to end and
+    /// proves the byte is actually delivered once the queue has room again,
+    /// not merely that the phase bookkeeping is honest about the loss.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flush_before_handoff_retries_through_a_transient_full_queue() {
+        let (runtime, mut rx) = PaneRuntime::test_with_channel_capacity(80, 24, 1);
+        // Fill the single slot so the flush below must retry.
+        runtime
+            .try_send_bytes(Bytes::from_static(b"filler"))
+            .unwrap();
+        runtime.schedule_run_bytes_after(
+            "run_full_queue".to_string(),
+            Bytes::from_static(RUN_ENTER),
+            std::time::Duration::from_secs(10),
+        );
+
+        // Simulates the actor catching up on an actively-draining queue:
+        // the retry loop inside the handoff flush must still be running
+        // (blocking a different worker thread) when this drains the filler
+        // and frees capacity for a later retry attempt to succeed.
+        let drain_task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(b"filler"));
+            let delivered = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("the retried flush must actually deliver the byte")
+                .unwrap();
+            assert_eq!(delivered, Bytes::from_static(RUN_ENTER));
+        });
+
+        // `preserve_for_handoff` blocks synchronously (including the retry
+        // loop's backoff sleeps), so run it as its own task to let
+        // `drain_task` make progress concurrently on the other worker
+        // thread instead of starving it.
+        let handoff_task = tokio::spawn(async move {
+            runtime.preserve_for_handoff();
+        });
+
+        handoff_task.await.expect("handoff task must not panic");
+        drain_task
+            .await
+            .expect("drain task must observe the delivered byte");
     }
 
     /// Exercises the real `schedule_run_bytes_after` / `cancel_scheduled_run_input`
