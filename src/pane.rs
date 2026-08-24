@@ -4,7 +4,7 @@ use std::io;
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering},
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
 };
 
 use bytes::Bytes;
@@ -1047,15 +1047,112 @@ pub struct PaneRuntime {
     full_lifecycle_authority_active: Arc<AtomicBool>,
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
-    pending_run_inputs: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    pending_run_inputs: Arc<Mutex<HashMap<String, Arc<PendingRunInput>>>>,
     preserve_processes_on_drop: bool,
+    /// Set only by a handoff commit so `Drop` leaves scheduled run inputs
+    /// (e.g. a durable run's delayed Enter) to resolve on their already
+    /// spawned delivery task instead of discarding them at teardown.
+    preserve_run_inputs_on_drop: bool,
     // Task handles for deterministic shutdown
     detect_handle: Option<tokio::task::AbortHandle>,
 }
 
+/// Lifecycle of one scheduled run input (a delayed keystroke, e.g. the Enter
+/// that submits a durable run's prompt after the agent has had time to accept
+/// pasted text).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunInputPhase {
+    /// Not yet claimed by delivery or cancellation.
+    Pending,
+    /// Cancelled before delivery claimed it; it will never be written.
+    Cancelled,
+    /// Delivery claimed it and is writing it now.
+    Delivering,
+    /// Delivery finished writing it (or the write failed).
+    Delivered,
+}
+
+/// Serializes one scheduled run input's delayed delivery against a caller
+/// that wants to cancel it, so a subsequent write from that caller (e.g. an
+/// interrupt) can never race ahead of, or follow, an in-flight delivery.
+struct PendingRunInput {
+    phase: Mutex<RunInputPhase>,
+    resolved: Condvar,
+}
+
+impl PendingRunInput {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            phase: Mutex::new(RunInputPhase::Pending),
+            resolved: Condvar::new(),
+        })
+    }
+
+    fn lock_phase(&self) -> std::sync::MutexGuard<'_, RunInputPhase> {
+        match self.phase.lock() {
+            Ok(phase) => phase,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Claim delivery. Returns true at most once, and only if cancellation
+    /// did not already win the race.
+    fn begin_delivery(&self) -> bool {
+        let mut phase = self.lock_phase();
+        if *phase == RunInputPhase::Pending {
+            *phase = RunInputPhase::Delivering;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Mark delivery finished (written or failed) and wake any waiter.
+    fn finish_delivery(&self) {
+        let mut phase = self.lock_phase();
+        *phase = RunInputPhase::Delivered;
+        drop(phase);
+        self.resolved.notify_all();
+    }
+
+    /// Cancel without waiting for an in-flight delivery to resolve. Used for
+    /// a real teardown where nothing observes the outcome, so there is
+    /// nothing to gain from blocking on a delivery that may itself be
+    /// waiting on queue capacity that teardown will never free.
+    fn cancel_without_waiting(&self) {
+        let mut phase = self.lock_phase();
+        if *phase == RunInputPhase::Pending {
+            *phase = RunInputPhase::Cancelled;
+        }
+    }
+
+    /// Cancel this input. If delivery already claimed it, block until that
+    /// delivery fully resolves before returning, so the caller's next write
+    /// (e.g. an interrupt) is guaranteed to observe the delayed input as
+    /// either fully suppressed or already sent, never still in flight.
+    fn cancel_and_await_resolution(&self) {
+        let mut phase = self.lock_phase();
+        loop {
+            match *phase {
+                RunInputPhase::Pending => {
+                    *phase = RunInputPhase::Cancelled;
+                    return;
+                }
+                RunInputPhase::Cancelled | RunInputPhase::Delivered => return,
+                RunInputPhase::Delivering => {
+                    phase = match self.resolved.wait(phase) {
+                        Ok(phase) => phase,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                }
+            }
+        }
+    }
+}
+
 fn lock_pending_run_inputs(
-    pending_run_inputs: &Mutex<HashMap<String, Arc<AtomicBool>>>,
-) -> std::sync::MutexGuard<'_, HashMap<String, Arc<AtomicBool>>> {
+    pending_run_inputs: &Mutex<HashMap<String, Arc<PendingRunInput>>>,
+) -> std::sync::MutexGuard<'_, HashMap<String, Arc<PendingRunInput>>> {
     match pending_run_inputs.lock() {
         Ok(pending_run_inputs) => pending_run_inputs,
         Err(poisoned) => poisoned.into_inner(),
@@ -1063,14 +1160,14 @@ fn lock_pending_run_inputs(
 }
 
 fn retire_pending_run_input(
-    pending_run_inputs: &Mutex<HashMap<String, Arc<AtomicBool>>>,
+    pending_run_inputs: &Mutex<HashMap<String, Arc<PendingRunInput>>>,
     run_id: &str,
-    cancellation: &Arc<AtomicBool>,
+    handle: &Arc<PendingRunInput>,
 ) {
     let mut pending_run_inputs = lock_pending_run_inputs(pending_run_inputs);
     if pending_run_inputs
         .get(run_id)
-        .is_some_and(|current| Arc::ptr_eq(current, cancellation))
+        .is_some_and(|current| Arc::ptr_eq(current, handle))
     {
         pending_run_inputs.remove(run_id);
     }
@@ -1273,7 +1370,9 @@ impl Drop for PaneRuntime {
         if let Some(handle) = &self.detect_handle {
             handle.abort();
         }
-        self.cancel_all_scheduled_run_inputs();
+        if !self.preserve_run_inputs_on_drop {
+            self.cancel_all_scheduled_run_inputs();
+        }
         self.io.shutdown();
         if !self.preserve_processes_on_drop {
             shutdown_pane_processes(
@@ -1667,7 +1766,12 @@ impl PaneRuntime {
         if let Some(handle) = self.detect_handle.take() {
             handle.abort();
         }
-        self.cancel_all_scheduled_run_inputs();
+        // Deliberately do not cancel scheduled run inputs here: a persisted
+        // durable run may have committed `Running` with a delayed Enter still
+        // outstanding, and losing it at handoff would leave that run bound to
+        // its pane forever with no way to reach an observed outcome. Leave
+        // the already spawned delivery task to resolve on its own.
+        self.preserve_run_inputs_on_drop = true;
         self.preserve_processes_on_drop = true;
     }
 
@@ -2056,6 +2160,7 @@ impl PaneRuntime {
             pending_release,
             pending_run_inputs: Arc::new(Mutex::new(HashMap::new())),
             preserve_processes_on_drop: true,
+            preserve_run_inputs_on_drop: false,
             detect_handle: Some(detect_handle),
         })
     }
@@ -2608,6 +2713,7 @@ impl PaneRuntime {
             pending_release,
             pending_run_inputs: Arc::new(Mutex::new(HashMap::new())),
             preserve_processes_on_drop: false,
+            preserve_run_inputs_on_drop: false,
             detect_handle,
         })
     }
@@ -2900,56 +3006,64 @@ impl PaneRuntime {
         bytes: Bytes,
         delay: std::time::Duration,
     ) {
-        let cancellation = Arc::new(AtomicBool::new(false));
+        let handle = PendingRunInput::new();
         let previous = lock_pending_run_inputs(&self.pending_run_inputs)
-            .insert(run_id.clone(), cancellation.clone());
+            .insert(run_id.clone(), handle.clone());
         if let Some(previous) = previous {
-            previous.store(true, Ordering::Release);
+            previous.cancel_and_await_resolution();
         }
         let pending_run_inputs = Arc::clone(&self.pending_run_inputs);
         match &self.io {
             PaneRuntimeIo::Actor(actor) => {
                 let actor = actor.clone();
+                let delivery = handle.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
-                    if !cancellation.load(Ordering::Acquire) {
+                    if delivery.begin_delivery() {
                         if let Err(err) = actor.write_user_input(bytes).await {
                             warn!(error = %err, "failed to send delayed run input");
                         }
+                        delivery.finish_delivery();
                     }
-                    retire_pending_run_input(&pending_run_inputs, &run_id, &cancellation);
+                    retire_pending_run_input(&pending_run_inputs, &run_id, &delivery);
                 });
             }
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { sender, .. } => {
                 let sender = sender.clone();
+                let delivery = handle.clone();
                 if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                     std::mem::drop(runtime.spawn(async move {
                         tokio::time::sleep(delay).await;
-                        if !cancellation.load(Ordering::Acquire) {
+                        if delivery.begin_delivery() {
                             let _ = sender.send(bytes).await;
+                            delivery.finish_delivery();
                         }
-                        retire_pending_run_input(&pending_run_inputs, &run_id, &cancellation);
+                        retire_pending_run_input(&pending_run_inputs, &run_id, &delivery);
                     }));
                 } else {
-                    cancellation.store(true, Ordering::Release);
-                    retire_pending_run_input(&pending_run_inputs, &run_id, &cancellation);
+                    delivery.cancel_and_await_resolution();
+                    retire_pending_run_input(&pending_run_inputs, &run_id, &delivery);
                 }
             }
         }
     }
 
+    /// Cancel a scheduled run input. If its delivery already started, this
+    /// blocks until that delivery is fully resolved before returning, so a
+    /// caller that writes an interrupt right after this call can never race
+    /// ahead of the delayed input landing on the pane.
     pub fn cancel_scheduled_run_input(&self, run_id: &str) {
-        if let Some(cancellation) = lock_pending_run_inputs(&self.pending_run_inputs).remove(run_id)
-        {
-            cancellation.store(true, Ordering::Release);
+        let handle = lock_pending_run_inputs(&self.pending_run_inputs).remove(run_id);
+        if let Some(handle) = handle {
+            handle.cancel_and_await_resolution();
         }
     }
 
     fn cancel_all_scheduled_run_inputs(&self) {
         let mut pending_run_inputs = lock_pending_run_inputs(&self.pending_run_inputs);
-        for cancellation in pending_run_inputs.values() {
-            cancellation.store(true, Ordering::Release);
+        for handle in pending_run_inputs.values() {
+            handle.cancel_without_waiting();
         }
         pending_run_inputs.clear();
     }
@@ -3227,6 +3341,7 @@ impl PaneRuntime {
                 pending_release: Arc::new(Mutex::new(None)),
                 pending_run_inputs: Arc::new(Mutex::new(HashMap::new())),
                 preserve_processes_on_drop: true,
+                preserve_run_inputs_on_drop: false,
                 detect_handle: Some(tokio::spawn(async {}).abort_handle()),
             },
             rx,
@@ -3237,6 +3352,106 @@ impl PaneRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const RUN_ENTER: &[u8] = b"\r";
+
+    // NAK-439 durable-run race coverage.
+
+    /// Defect: `preserve_for_handoff` used to cancel every scheduled run
+    /// input synchronously, so a persisted `Running` run's delayed Enter was
+    /// discarded the instant a pane handed off, leaving that run bound to its
+    /// pane forever with no way to reach an observed outcome.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scheduled_run_input_survives_handoff_and_is_still_delivered() {
+        let (runtime, mut rx) = PaneRuntime::test_with_channel(80, 24);
+        runtime.schedule_run_bytes_after(
+            "run_handoff".to_string(),
+            Bytes::from_static(RUN_ENTER),
+            std::time::Duration::from_millis(30),
+        );
+
+        runtime.preserve_for_handoff();
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("delayed run input must still be delivered after handoff")
+                .expect("channel open"),
+            Bytes::from_static(RUN_ENTER)
+        );
+    }
+
+    /// A real close (not a handoff) must still discard scheduled run input
+    /// instead of writing it into a pane nobody is going to read again.
+    #[tokio::test]
+    async fn scheduled_run_input_is_dropped_on_real_shutdown() {
+        let (runtime, mut rx) = PaneRuntime::test_with_channel(80, 24);
+        runtime.schedule_run_bytes_after(
+            "run_shutdown".to_string(),
+            Bytes::from_static(RUN_ENTER),
+            std::time::Duration::from_millis(30),
+        );
+
+        runtime.shutdown();
+
+        // Either the channel times out or closes with nothing queued; either
+        // way, the scheduled Enter itself must never actually arrive.
+        if let Ok(Some(bytes)) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await
+        {
+            panic!("a real shutdown must not deliver the scheduled run input, got {bytes:?}");
+        }
+    }
+
+    /// Defect: cancellation and delayed delivery raced as an unsynchronized
+    /// check-then-write, so an interrupt sent right after cancelling could
+    /// land on the pane before a delayed Enter that had already started
+    /// writing, or the Enter could still land after the interrupt. Cancel
+    /// must fully resolve (suppressed, or already delivered) before it
+    /// returns.
+    #[test]
+    fn cancel_before_delivery_claims_it_permanently_suppresses_delivery() {
+        let handle = PendingRunInput::new();
+
+        handle.cancel_and_await_resolution();
+
+        assert!(
+            !handle.begin_delivery(),
+            "a cancelled input must never begin delivery"
+        );
+    }
+
+    #[test]
+    fn cancel_of_an_in_flight_delivery_blocks_until_delivery_resolves() {
+        let handle = PendingRunInput::new();
+        assert!(handle.begin_delivery());
+
+        let waiter = Arc::clone(&handle);
+        let cancel_thread = std::thread::spawn(move || {
+            waiter.cancel_and_await_resolution();
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !cancel_thread.is_finished(),
+            "cancel must block while delivery is in flight, not race ahead of it"
+        );
+
+        handle.finish_delivery();
+        cancel_thread
+            .join()
+            .expect("cancel thread must resolve once delivery finishes");
+    }
+
+    #[test]
+    fn cancel_after_delivery_already_finished_is_a_no_op() {
+        let handle = PendingRunInput::new();
+        assert!(handle.begin_delivery());
+        handle.finish_delivery();
+
+        handle.cancel_and_await_resolution();
+    }
 
     #[test]
     fn pane_launch_env_removes_outer_codex_thread_id() {
@@ -3788,6 +4003,7 @@ mod tests {
             pending_release: Arc::new(Mutex::new(None)),
             pending_run_inputs: Arc::new(Mutex::new(HashMap::new())),
             preserve_processes_on_drop: true,
+            preserve_run_inputs_on_drop: false,
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
 
@@ -3822,6 +4038,7 @@ mod tests {
             pending_release: Arc::new(Mutex::new(None)),
             pending_run_inputs: Arc::new(Mutex::new(HashMap::new())),
             preserve_processes_on_drop: true,
+            preserve_run_inputs_on_drop: false,
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
 
