@@ -462,8 +462,15 @@ impl crate::app::App {
 
     pub(super) fn handle_run_cancel(&mut self, id: String, params: RunCancelParams) -> String {
         let now_unix = Self::run_now_unix();
-        let previous_registry = self.run_registry.clone();
-        let mut pending = previous_registry.clone();
+        let mut pending = self.run_registry.clone();
+        // Snapshot the registry immediately after `authorize()` burns the
+        // capability's replay-protection sequence, before `request_cancel`
+        // below mutates the run record. If the interrupt later fails to
+        // send, we revert to exactly this snapshot: the sequence burn from
+        // a genuinely successful authorization must remain permanent (a
+        // capability+sequence pair may never be replayed), even though the
+        // run's `CancelRequested` transition itself gets undone.
+        let mut authorized_registry: Option<RunRegistry> = None;
         // Resolve everything needed to actually deliver the interrupt first
         // (authorization, the target run's cancellability, the live pane,
         // and the encoded Ctrl-C bytes), and only once delivery is truly
@@ -481,6 +488,7 @@ impl crate::app::App {
                 RunOperation::Cancel,
                 now_unix,
             )?;
+            authorized_registry = Some(pending.clone());
             let record = pending.get(&params.run_id, &scope)?.clone();
             let requested = Self::record_requested_binding(&record)?;
             let target = self.live_run_target(&requested)?;
@@ -520,18 +528,51 @@ impl crate::app::App {
         runtime.cancel_scheduled_run_input(&params.run_id);
         if runtime.try_send_bytes(Bytes::from(encoded)).is_err() {
             // The interrupt never reached the pane: compensate by reverting
-            // the just-persisted `CancelRequested` so the durable record
-            // stays truthful and this run remains retryable instead of
-            // stuck claiming a cancellation nobody ever signalled.
-            if let Err(revert_error) = self.persist_run_registry(previous_registry) {
-                tracing::warn!(
-                    error_code = revert_error.code(),
-                    "failed to revert a durably-persisted cancellation after the interrupt write failed"
-                );
+            // just the `CancelRequested` transition (back to the state
+            // captured right after authorization) so the durable record
+            // stays truthful and this run remains retryable, without
+            // un-burning the capability sequence that authorize() already
+            // permanently consumed.
+            let reverted = authorized_registry
+                .expect("authorized_registry is set once authorize() succeeds, which it must have for `prepared` to reach this branch");
+            if !self.revert_run_registry_after_failed_interrupt(reverted) {
+                return Self::run_error(id, RunError::PersistenceUnavailable);
             }
             return Self::run_error(id, RunError::TargetUnavailable);
         }
         Self::run_success(id, ResponseResult::RunCancelRequested { run })
+    }
+
+    /// Revert the durable registry to `reverted` after a delivered-but-
+    /// unwritten interrupt, so a run never stays durably `CancelRequested`
+    /// with no interrupt actually in flight.
+    ///
+    /// Returns `true` once the revert itself is durable. If the revert save
+    /// fails, the just-persisted `CancelRequested` cannot be undone and
+    /// cannot be trusted either: rather than leave that durable lie standing
+    /// with only a log line, this disables every future run operation
+    /// (`run_registry_load_error`) the same way a corrupt or unreadable
+    /// registry does at startup, so the inconsistency is surfaced to every
+    /// caller instead of silently going unnoticed.
+    fn revert_run_registry_after_failed_interrupt(&mut self, reverted: RunRegistry) -> bool {
+        let Some(path) = self.run_registry_path.clone() else {
+            return true;
+        };
+        match crate::persist::run_registry::save_to_path(&path, &reverted) {
+            Ok(()) => {
+                self.run_registry = reverted;
+                true
+            }
+            Err(_) => {
+                tracing::error!(
+                    "failed to revert a durably-persisted cancellation after the interrupt write \
+                     failed; disabling durable run operations until this is investigated"
+                );
+                self.run_registry_load_error =
+                    Some("durable run registry is unavailable".to_string());
+                false
+            }
+        }
     }
 }
 
@@ -1869,6 +1910,88 @@ mod tests {
                 .is_err(),
             "the interrupt must never be sent when the pending CancelRequested cannot be persisted"
         );
+    }
+
+    // Defect: the compensating revert on a failed interrupt used to restore
+    // the registry snapshot captured *before* `authorize()` ran, which
+    // un-burned the capability's replay-protection sequence along with the
+    // run's `CancelRequested` transition. A capability+sequence that
+    // genuinely authorized must never become replayable just because the
+    // interrupt delivery that followed happened to fail.
+    #[tokio::test]
+    async fn failed_interrupt_delivery_keeps_the_capability_sequence_permanently_burned() {
+        let temp = TempRegistry::new("cancel-sequence-burn");
+        let mut fixture = live_run_fixture(&temp);
+        let run = fixture.seed_run("cancel-sequence-burn", RunState::Running);
+        fixture.prompt_rx.take();
+        let capability = fixture.issue_capability(vec![RunOperation::Cancel]);
+
+        let cancelled = fixture.request(
+            "cancel",
+            Method::RunCancel(RunCancelParams {
+                capability: capability.clone(),
+                run_id: run.run_id.clone(),
+            }),
+        );
+        assert_eq!(cancelled["error"]["code"], "run_target_unavailable");
+
+        let mut persisted = crate::persist::run_registry::load_from_path(&temp.path)
+            .expect("registry after failed interrupt");
+        assert_eq!(
+            persisted.authorize(
+                &crate::runs::auth::CapabilityRef {
+                    capability_id: capability.capability_id,
+                    sequence: capability.sequence,
+                },
+                RunOperation::Cancel,
+                crate::app::App::run_now_unix(),
+            ),
+            Err(RunError::ReplayRejected),
+            "a capability sequence consumed by a genuinely successful authorize() must stay \
+             permanently burned even when the interrupt delivery that followed failed"
+        );
+    }
+
+    // Defect: if the compensating persist itself failed, the code only
+    // logged a warning and returned `TargetUnavailable`, leaving the
+    // durable record standing at `CancelRequested` with no interrupt ever
+    // delivered and no way for a caller to detect the inconsistency. The
+    // fix must not let that lie stand silently.
+    #[test]
+    fn failed_compensating_revert_disables_durable_run_operations_instead_of_lying() {
+        let temp = TempRegistry::new("cancel-revert-save-failure");
+        let (mut app, _workspace_id) = app_with_workspace_and_path(&temp);
+        let before = app.run_registry.clone();
+        let blocked_parent = temp.directory.join("not-a-directory");
+        std::fs::write(&blocked_parent, b"block registry save").expect("blocked registry parent");
+        app.run_registry_path = Some(blocked_parent.join("runs.json"));
+
+        let reverted_ok = app.revert_run_registry_after_failed_interrupt(RunRegistry::default());
+
+        assert!(
+            !reverted_ok,
+            "a failed revert save must be reported as failed"
+        );
+        assert_eq!(
+            app.run_registry, before,
+            "the in-memory registry must not silently adopt an unpersisted revert"
+        );
+        assert!(
+            app.run_registry_load_error.is_some(),
+            "a failed compensating persist must disable durable run operations, not just log"
+        );
+
+        // Prove this is actually enforced, not merely an internal flag:
+        // every subsequent run operation must now fail closed instead of
+        // ever risking a read against the untrustworthy durable state.
+        let status = response(app.handle_run_status(
+            "status-after-broken-revert".to_string(),
+            RunStatusParams {
+                capability: capability(1),
+                run_id: "run-a".to_string(),
+            },
+        ));
+        assert_eq!(status["error"]["code"], "run_persistence_unavailable");
     }
 
     // Direct ordering proof for the same defect: at the exact moment the

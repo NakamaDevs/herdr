@@ -1064,8 +1064,14 @@ enum RunInputPhase {
     Cancelled,
     /// Delivery claimed it and is writing it now.
     Delivering,
-    /// Delivery finished writing it (or the write failed).
+    /// Delivery finished writing it, successfully.
     Delivered,
+    /// Delivery claimed it but the write could not be enqueued at all (e.g.
+    /// a full or closed transport during a handoff flush). Distinct from
+    /// `Delivered` so a lost write is never mistaken for a sent one. Only
+    /// constructed by the unix-only handoff flush path.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Undelivered,
 }
 
 /// Serializes one scheduled run input's delayed delivery against a caller
@@ -1107,10 +1113,23 @@ impl PendingRunInput {
         }
     }
 
-    /// Mark delivery finished (written or failed) and wake any waiter.
+    /// Mark delivery finished (written, or failed after the normal delayed
+    /// path already committed to a single attempt) and wake any waiter.
     fn finish_delivery(&self) {
         let mut phase = self.lock_phase();
         *phase = RunInputPhase::Delivered;
+        drop(phase);
+        self.resolved.notify_all();
+    }
+
+    /// Mark delivery as claimed but never actually sent (the write could not
+    /// be enqueued at all), and wake any waiter. Kept distinct from
+    /// `finish_delivery` so a caller can never observe a lost write as a
+    /// delivered one.
+    #[cfg(unix)]
+    fn fail_delivery(&self) {
+        let mut phase = self.lock_phase();
+        *phase = RunInputPhase::Undelivered;
         drop(phase);
         self.resolved.notify_all();
     }
@@ -1138,7 +1157,9 @@ impl PendingRunInput {
                     *phase = RunInputPhase::Cancelled;
                     return;
                 }
-                RunInputPhase::Cancelled | RunInputPhase::Delivered => return,
+                RunInputPhase::Cancelled
+                | RunInputPhase::Delivered
+                | RunInputPhase::Undelivered => return,
                 RunInputPhase::Delivering => {
                     phase = match self.resolved.wait(phase) {
                         Ok(phase) => phase,
@@ -1167,13 +1188,21 @@ impl PendingRunInput {
                 RunInputPhase::Pending => {
                     *phase = RunInputPhase::Delivering;
                     drop(phase);
-                    if let Err(err) = io.try_send_bytes(self.bytes.clone()) {
-                        warn!(error = ?err, "failed to flush delayed run input before handoff");
+                    match io.try_send_bytes(self.bytes.clone()) {
+                        Ok(()) => self.finish_delivery(),
+                        Err(err) => {
+                            error!(
+                                error = ?err,
+                                "lost delayed run input: could not flush it before handoff"
+                            );
+                            self.fail_delivery();
+                        }
                     }
-                    self.finish_delivery();
                     return;
                 }
-                RunInputPhase::Cancelled | RunInputPhase::Delivered => return,
+                RunInputPhase::Cancelled
+                | RunInputPhase::Delivered
+                | RunInputPhase::Undelivered => return,
                 RunInputPhase::Delivering => {
                     phase = match self.resolved.wait(phase) {
                         Ok(phase) => phase,
@@ -3606,6 +3635,32 @@ mod tests {
         );
     }
 
+    /// Defect: `flush_before_handoff` unconditionally called `finish_delivery`
+    /// (marking the input `Delivered`) even when `try_send_bytes` failed --
+    /// e.g. because the transport's queue was full or closed -- so a lost
+    /// write during handoff looked exactly like a successful one.
+    #[cfg(unix)]
+    #[test]
+    fn flush_before_handoff_does_not_mark_delivered_when_the_transport_rejects_the_write() {
+        let (sender, receiver) = mpsc::channel::<Bytes>(1);
+        drop(receiver); // closed transport: try_send_bytes must fail
+        let (resize_tx, _resize_rx) = watch::channel((24, 80, 0, 0));
+        let io = PaneRuntimeIo::TestChannel {
+            sender,
+            resize_tx,
+            input_observer: None,
+        };
+        let handle = PendingRunInput::new(Bytes::from_static(RUN_ENTER));
+
+        handle.flush_before_handoff(&io);
+
+        assert_eq!(
+            *handle.phase.lock().unwrap(),
+            RunInputPhase::Undelivered,
+            "a rejected write during handoff flush must not be recorded as delivered"
+        );
+    }
+
     /// Exercises the real `schedule_run_bytes_after` / `cancel_scheduled_run_input`
     /// call path (not the internal `PendingRunInput` type) with a real
     /// synchronization barrier instead of a fixed sleep: an observer fires
@@ -3648,12 +3703,32 @@ mod tests {
             .await
             .expect("delivery must claim the scheduled input before cancel races it");
 
+        // Second synchronization point: proves the cancelling task has
+        // actually been scheduled and reached the call into
+        // `cancel_scheduled_run_input`, not merely that it was spawned.
+        // Without this, a broken, non-blocking `cancel_and_await_resolution`
+        // could still pass the `!is_finished()` check below simply because
+        // tokio hadn't gotten around to running the task at all yet -- proof
+        // that delivery claimed the input is not proof the canceller ever
+        // raced it. There is no `.await` between the signal and the call
+        // itself, so once this task is scheduled at all, both happen back to
+        // back within the same poll; combined with the channel staying full
+        // until drained below (so the phase this call observes cannot have
+        // moved past `Delivering`), reaching the call means it is
+        // deterministically about to enter the blocking wait.
+        let cancel_started = Arc::new(tokio::sync::Notify::new());
+        let cancel_started_signal = Arc::clone(&cancel_started);
         // `PaneRuntime` is `Send` (moveable to another task) but not `Sync`
         // (it is not meant to be shared across tasks concurrently), so hand
         // it to the cancelling task by value instead of sharing a reference.
         let cancel_task = tokio::spawn(async move {
+            cancel_started_signal.notify_one();
             runtime.cancel_scheduled_run_input("run_in_flight");
         });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), cancel_started.notified())
+            .await
+            .expect("the cancelling task must actually run");
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(
