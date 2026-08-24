@@ -1232,6 +1232,25 @@ const HANDOFF_FLUSH_RETRY_ATTEMPTS: u32 = 40;
 #[cfg(unix)]
 const HANDOFF_FLUSH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
 
+// Test-only hook fired the instant a retry attempt in
+// try_send_bytes_with_bounded_retry observes TrySendError::Full, so a test
+// can prove the retry loop genuinely started (rather than assuming a fixed
+// delay was long enough) before acting on that knowledge. A plain
+// thread-local is sound here even under a multi-threaded test runtime:
+// nothing between a test registering the hook and the retry loop's first
+// Full observation crosses an .await point, so that whole chain always runs
+// on the one OS thread that registered it.
+#[cfg(all(test, unix))]
+thread_local! {
+    static TEST_ON_FULL_RETRY: std::cell::RefCell<Option<Arc<dyn Fn() + Send + Sync>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+fn test_set_on_full_retry_hook(hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+    TEST_ON_FULL_RETRY.with(|cell| *cell.borrow_mut() = hook);
+}
+
 /// Retry `io.try_send_bytes(bytes)` while the transport merely reports a
 /// full queue, up to a bounded attempt count. A closed transport is
 /// returned immediately: the actor itself is gone, so nothing is left to
@@ -1247,6 +1266,12 @@ fn try_send_bytes_with_bounded_retry(
         match io.try_send_bytes(bytes) {
             Ok(()) => return Ok(()),
             Err(mpsc::error::TrySendError::Full(returned)) => {
+                #[cfg(test)]
+                TEST_ON_FULL_RETRY.with(|cell| {
+                    if let Some(hook) = cell.borrow().as_ref() {
+                        hook();
+                    }
+                });
                 attempts_remaining -= 1;
                 if attempts_remaining == 0 {
                     return Err(mpsc::error::TrySendError::Full(returned));
@@ -3713,6 +3738,13 @@ mod tests {
     /// the real handoff entry point (`preserve_for_handoff`) end to end and
     /// proves the byte is actually delivered once the queue has room again,
     /// not merely that the phase bookkeeping is honest about the loss.
+    ///
+    /// A real synchronization point (`TEST_ON_FULL_RETRY`, mirroring the
+    /// `cancel_started` barrier used for the in-flight-cancellation test)
+    /// proves the retry loop actually observed a full queue on its first
+    /// attempt before the filler is drained -- not merely that a fixed
+    /// delay elapsed, which a late-scheduled `handoff_task` could satisfy
+    /// without ever exercising a retry at all.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn flush_before_handoff_retries_through_a_transient_full_queue() {
@@ -3727,32 +3759,43 @@ mod tests {
             std::time::Duration::from_secs(10),
         );
 
-        // Simulates the actor catching up on an actively-draining queue:
-        // the retry loop inside the handoff flush must still be running
-        // (blocking a different worker thread) when this drains the filler
-        // and frees capacity for a later retry attempt to succeed.
-        let drain_task = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(b"filler"));
-            let delivered = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-                .await
-                .expect("the retried flush must actually deliver the byte")
-                .unwrap();
-            assert_eq!(delivered, Bytes::from_static(RUN_ENTER));
-        });
+        let full_observed = Arc::new(tokio::sync::Notify::new());
+        let full_observed_signal = Arc::clone(&full_observed);
 
         // `preserve_for_handoff` blocks synchronously (including the retry
-        // loop's backoff sleeps), so run it as its own task to let
-        // `drain_task` make progress concurrently on the other worker
-        // thread instead of starving it.
+        // loop's backoff sleeps), so run it as its own task to let the
+        // draining below make progress concurrently on the other worker
+        // thread instead of starving it. The hook is registered from
+        // inside this same task: everything from here through the retry
+        // loop's first `Full` observation is one synchronous call chain
+        // with no `.await` in between, so it never migrates off whatever
+        // thread tokio schedules this task onto.
         let handoff_task = tokio::spawn(async move {
+            test_set_on_full_retry_hook(Some(Arc::new(move || {
+                full_observed_signal.notify_one();
+            })));
             runtime.preserve_for_handoff();
+            test_set_on_full_retry_hook(None);
         });
 
-        handoff_task.await.expect("handoff task must not panic");
-        drain_task
+        // Real barrier: proves the retry loop has genuinely observed a full
+        // queue before the filler is drained, instead of assuming a fixed
+        // delay was long enough. Without this, a late-scheduled
+        // `handoff_task` could see the already-drained slot on its very
+        // first attempt -- exercising no retry at all -- and the test
+        // would still pass, proving nothing about the retry path.
+        tokio::time::timeout(std::time::Duration::from_secs(2), full_observed.notified())
             .await
-            .expect("drain task must observe the delivered byte");
+            .expect("the retry loop must observe a full queue before the filler is drained");
+
+        assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(b"filler"));
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("the retried flush must actually deliver the byte")
+            .unwrap();
+        assert_eq!(delivered, Bytes::from_static(RUN_ENTER));
+
+        handoff_task.await.expect("handoff task must not panic");
     }
 
     /// Exercises the real `schedule_run_bytes_after` / `cancel_scheduled_run_input`
