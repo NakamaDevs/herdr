@@ -387,7 +387,7 @@ fn valid_registry_disk(disk: &RunRegistryDisk) -> bool {
         && disk.capabilities.iter().all(|capability| {
             bounded_identifier(&capability.capability_id, MAX_TARGET_LEN)
                 && bounded_identifier(&capability.workspace_id, MAX_WORKSPACE_ID_LEN)
-                && capability.issued_at_unix <= capability.expires_at_unix
+                && capability.valid_timestamps()
                 && !capability.operations.is_empty()
                 && capability.operations.len() <= auth::MAX_CAPABILITY_OPERATIONS
                 && capability.operations.iter().collect::<HashSet<_>>().len()
@@ -556,12 +556,29 @@ impl RunRegistry {
     }
 
     /// Issue a capability scoped to one workspace and operation set.
+    #[cfg(test)]
     pub fn issue_capability(
         &mut self,
         workspace_id: &str,
         ttl_ms: u64,
         operations: &[RunOperation],
         now_unix: u64,
+    ) -> Result<Capability, RunError> {
+        self.issue_capability_at_millis(
+            workspace_id,
+            ttl_ms,
+            operations,
+            now_unix.saturating_mul(1000),
+        )
+    }
+
+    /// Issue a capability without rounding its issuance or lifetime.
+    pub fn issue_capability_at_millis(
+        &mut self,
+        workspace_id: &str,
+        ttl_ms: u64,
+        operations: &[RunOperation],
+        now_unix_ms: u64,
     ) -> Result<Capability, RunError> {
         if !bounded_identifier(workspace_id, MAX_WORKSPACE_ID_LEN) {
             return Err(RunError::InvalidRequest(RunInvalidField::WorkspaceId));
@@ -575,7 +592,11 @@ impl RunRegistry {
         {
             return Err(RunError::InvalidRequest(RunInvalidField::Operations));
         }
-        self.capabilities.retain(|cap| !cap.is_expired(now_unix));
+        let expires_at_unix_ms = now_unix_ms
+            .checked_add(ttl_ms)
+            .ok_or(RunError::InvalidRequest(RunInvalidField::Ttl))?;
+        self.capabilities
+            .retain(|cap| !cap.is_expired_at_millis(now_unix_ms));
         self.next_capability_seq = self.next_capability_seq.saturating_add(1);
         let capability = Capability {
             capability_id: format!(
@@ -585,8 +606,10 @@ impl RunRegistry {
             ),
             workspace_id: workspace_id.to_string(),
             operations: operations.to_vec(),
-            issued_at_unix: now_unix,
-            expires_at_unix: now_unix.saturating_add(ttl_ms / 1000),
+            issued_at_unix: now_unix_ms / 1000,
+            expires_at_unix: expires_at_unix_ms.div_ceil(1000),
+            issued_at_unix_ms: Some(now_unix_ms),
+            expires_at_unix_ms: Some(expires_at_unix_ms),
             last_sequence: 0,
         };
         self.capabilities.push(capability.clone());
@@ -601,11 +624,22 @@ impl RunRegistry {
     /// The sequence is committed on every fully validated reference, including
     /// when the operation itself later fails, so a captured request can never
     /// be replayed.
+    #[cfg(test)]
     pub fn authorize(
         &mut self,
         capability: &CapabilityRef,
         operation: RunOperation,
         now_unix: u64,
+    ) -> Result<RunScope, RunError> {
+        self.authorize_at_millis(capability, operation, now_unix.saturating_mul(1000))
+    }
+
+    /// Authorize against the precise expiry time.
+    pub fn authorize_at_millis(
+        &mut self,
+        capability: &CapabilityRef,
+        operation: RunOperation,
+        now_unix_ms: u64,
     ) -> Result<RunScope, RunError> {
         if capability.sequence == 0 {
             return Err(RunError::InvalidRequest(RunInvalidField::Sequence));
@@ -617,7 +651,7 @@ impl RunRegistry {
         else {
             return Err(RunError::CapabilityInvalid);
         };
-        if cap.is_expired(now_unix) || !cap.allows(operation) {
+        if cap.is_expired_at_millis(now_unix_ms) || !cap.allows(operation) {
             return Err(RunError::CapabilityInvalid);
         }
         if capability.sequence <= cap.last_sequence {

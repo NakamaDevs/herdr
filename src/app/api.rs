@@ -8,7 +8,7 @@ mod layouts;
 mod pane_graphics;
 mod panes;
 pub(crate) mod plugins;
-mod responses;
+use crate::api::responses;
 mod runs;
 mod session;
 mod tabs;

@@ -1082,8 +1082,7 @@ enum RunInputPhase {
 /// that wants to cancel it, so a subsequent write from that caller (e.g. an
 /// interrupt) can never race ahead of, or follow, an in-flight delivery.
 struct PendingRunInput {
-    // Only read by the unix-only handoff flush path below.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    // Retained for cancellation recovery and handoff delivery.
     bytes: Bytes,
     phase: Mutex<RunInputPhase>,
     resolved: Condvar,
@@ -1153,17 +1152,17 @@ impl PendingRunInput {
     /// delivery fully resolves before returning, so the caller's next write
     /// (e.g. an interrupt) is guaranteed to observe the delayed input as
     /// either fully suppressed or already sent, never still in flight.
-    fn cancel_and_await_resolution(&self) {
+    /// Returns true when the input did not reach the transport.
+    fn cancel_and_await_resolution(&self) -> bool {
         let mut phase = self.lock_phase();
         loop {
             match *phase {
                 RunInputPhase::Pending => {
                     *phase = RunInputPhase::Cancelled;
-                    return;
+                    return true;
                 }
-                RunInputPhase::Cancelled
-                | RunInputPhase::Delivered
-                | RunInputPhase::Undelivered => return,
+                RunInputPhase::Cancelled | RunInputPhase::Undelivered => return true,
+                RunInputPhase::Delivered => return false,
                 RunInputPhase::Delivering => {
                     phase = match self.resolved.wait(phase) {
                         Ok(phase) => phase,
@@ -3243,11 +3242,14 @@ impl PaneRuntime {
     /// blocks until that delivery is fully resolved before returning, so a
     /// caller that writes an interrupt right after this call can never race
     /// ahead of the delayed input landing on the pane.
-    pub fn cancel_scheduled_run_input(&self, run_id: &str) {
+    /// Returns the exact bytes when the tracked input did not reach the transport.
+    pub fn cancel_scheduled_run_input(&self, run_id: &str) -> Option<Bytes> {
         let handle = lock_pending_run_inputs(&self.pending_run_inputs).remove(run_id);
-        if let Some(handle) = handle {
-            handle.cancel_and_await_resolution();
-        }
+        handle.and_then(|handle| {
+            handle
+                .cancel_and_await_resolution()
+                .then(|| handle.bytes.clone())
+        })
     }
 
     fn cancel_all_scheduled_run_inputs(&self) {
@@ -3957,7 +3959,9 @@ mod tests {
         // it to the cancelling task by value instead of sharing a reference.
         let cancel_task = tokio::spawn(async move {
             cancel_started_signal.notify_one();
-            runtime.cancel_scheduled_run_input("run_in_flight");
+            assert!(runtime
+                .cancel_scheduled_run_input("run_in_flight")
+                .is_none());
         });
 
         tokio::time::timeout(std::time::Duration::from_secs(2), cancel_started.notified())

@@ -6573,10 +6573,28 @@
               "minimum": 0,
               "type": "integer"
             },
+            "expires_at_unix_ms": {
+              "description": "Exact expiry time. Older records use the whole-second timestamp.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "issued_at_unix": {
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
+            },
+            "issued_at_unix_ms": {
+              "description": "Exact issuance time. Older records use the whole-second timestamp.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "last_sequence": {
               "default": 0,

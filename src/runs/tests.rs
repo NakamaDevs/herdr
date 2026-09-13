@@ -791,6 +791,77 @@ fn capability_expiry_and_scope() {
     );
 }
 
+#[test]
+fn capability_keeps_fractional_second_ttl_until_its_exact_boundary() {
+    let mut registry = RunRegistry::default();
+    let capability = registry
+        .issue_capability("w1", 1_999, &ALL_OPERATIONS, NOW)
+        .expect("capability");
+    assert!(
+        !capability.is_expired(NOW + 1),
+        "1,999 ms must last longer than one second"
+    );
+}
+
+#[test]
+fn capability_authorization_uses_exact_milliseconds_after_reload() {
+    let mut registry = RunRegistry::default();
+    let issued = NOW * 1000 + 731;
+    let capability = registry
+        .issue_capability_at_millis("w1", 1_999, &ALL_OPERATIONS, issued)
+        .expect("capability");
+    assert_eq!(capability.issued_at_unix_ms, Some(issued));
+    assert_eq!(capability.expires_at_unix_ms, Some(issued + 1_999));
+    let encoded = serde_json::to_string(&registry).expect("serialize");
+    let mut registry: RunRegistry = serde_json::from_str(&encoded).expect("reload");
+    let reference = CapabilityRef {
+        capability_id: capability.capability_id,
+        sequence: 1,
+    };
+    assert_eq!(
+        registry.authorize_at_millis(&reference, RunOperation::Status, issued + 1_998),
+        Ok(scope("w1"))
+    );
+    assert_eq!(
+        registry.authorize_at_millis(
+            &CapabilityRef {
+                sequence: 2,
+                ..reference
+            },
+            RunOperation::Status,
+            issued + 1_999
+        ),
+        Err(RunError::CapabilityInvalid)
+    );
+}
+
+#[test]
+fn legacy_capabilities_keep_their_recorded_expiry_after_reload() {
+    let mut registry = RunRegistry::default();
+    let capability = registry
+        .issue_capability("w1", 60_000, &ALL_OPERATIONS, NOW)
+        .expect("capability");
+    let mut value = serde_json::to_value(&registry).expect("serialize");
+    let legacy = value["capabilities"][0]
+        .as_object_mut()
+        .expect("capability object");
+    legacy.remove("issued_at_unix_ms");
+    legacy.remove("expires_at_unix_ms");
+    let mut registry: RunRegistry = serde_json::from_value(value).expect("legacy reload");
+    let reference = CapabilityRef {
+        capability_id: capability.capability_id,
+        sequence: 1,
+    };
+    assert_eq!(
+        registry.authorize_at_millis(&reference, RunOperation::Status, (NOW + 60) * 1000 - 1),
+        Ok(scope("w1"))
+    );
+    assert_eq!(
+        registry.authorize_at_millis(&reference, RunOperation::Status, (NOW + 60) * 1000),
+        Err(RunError::CapabilityInvalid)
+    );
+}
+
 // Matrix row 13.
 #[test]
 fn capability_rejects_replayed_sequence() {

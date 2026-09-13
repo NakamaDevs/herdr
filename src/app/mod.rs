@@ -99,9 +99,7 @@ impl PaneClickState {
 
 pub struct App {
     pub state: AppState,
-    pub(crate) run_registry: crate::runs::RunRegistry,
-    pub(crate) run_registry_path: Option<std::path::PathBuf>,
-    pub(crate) run_registry_load_error: Option<String>,
+    pub(crate) run_service: crate::server::runs::RunService,
     pub(crate) pane_graphics: pane_graphics::Runtime,
     pub(crate) pane_graphics_files: Arc<crate::pane_graphics_files::FileStore>,
     pub(crate) direct_graphics_available: bool,
@@ -757,17 +755,14 @@ impl App {
                 .and_then(|ws| ws.focused_pane_id().map(|pane_id| (idx, pane_id)))
         });
 
-        let (run_registry, run_registry_path, run_registry_load_error) =
-            Self::load_run_registry(no_session);
+        let run_service = crate::server::runs::RunService::load(no_session);
         let mut app = Self {
             config_diagnostic_deadline: None,
             toast_deadline: None,
             copy_feedback_deadline: None,
             last_api_notification_at: None,
             state,
-            run_registry,
-            run_registry_path,
-            run_registry_load_error,
+            run_service,
             pane_graphics: pane_graphics::Runtime::default(),
             pane_graphics_files: Arc::new(crate::pane_graphics_files::FileStore::default()),
             direct_graphics_available: false,
@@ -833,54 +828,9 @@ impl App {
         app
     }
 
-    fn load_run_registry(
-        no_session: bool,
-    ) -> (
-        crate::runs::RunRegistry,
-        Option<std::path::PathBuf>,
-        Option<String>,
-    ) {
-        if no_session || cfg!(test) {
-            return (crate::runs::RunRegistry::default(), None, None);
-        }
-        let path = crate::persist::run_registry::session_path();
-        if !path.exists() {
-            return (crate::runs::RunRegistry::default(), Some(path), None);
-        }
-        match crate::persist::run_registry::load_from_path(&path) {
-            Ok(registry) => (registry, Some(path), None),
-            Err(_) => (
-                crate::runs::RunRegistry::default(),
-                Some(path),
-                Some("durable run registry is unavailable".to_string()),
-            ),
-        }
-    }
-
-    /// Reconcile loaded active runs against restored runtime identities.
-    ///
-    /// This runs before the constructor returns, so queued API messages cannot
-    /// dispatch a durable run operation against unreconciled registry state.
     fn reconcile_run_registry_after_startup(&mut self) {
-        if self.run_registry_load_error.is_some() || self.run_registry_path.is_none() {
-            return;
-        }
-        let live_bindings = self.restored_run_bindings();
-        let mut next = self.run_registry.clone();
-        if next.reconcile_after_restart_with_bindings(&live_bindings, run_registry_now_unix()) == 0
-        {
-            return;
-        }
-        let Some(path) = self.run_registry_path.clone() else {
-            return;
-        };
-        match crate::persist::run_registry::save_to_path(&path, &next) {
-            Ok(()) => self.run_registry = next,
-            Err(_) => {
-                self.run_registry_load_error =
-                    Some("durable run registry is unavailable".to_string())
-            }
-        }
+        self.run_service
+            .reconcile_after_startup(&self.restored_run_bindings());
     }
 
     fn restored_run_bindings(&self) -> HashSet<crate::runs::RunObservationBinding> {
@@ -948,19 +898,7 @@ impl App {
 
     #[cfg(test)]
     pub(crate) fn set_run_registry_path_for_test(&mut self, path: std::path::PathBuf) {
-        if path.exists() {
-            match crate::persist::run_registry::load_from_path(&path) {
-                Ok(registry) => self.run_registry = registry,
-                Err(_) => {
-                    self.run_registry_load_error =
-                        Some("durable run registry is unavailable".to_string())
-                }
-            }
-        } else {
-            self.run_registry = crate::runs::RunRegistry::default();
-            self.run_registry_load_error = None;
-        }
-        self.run_registry_path = Some(path);
+        self.run_service = crate::server::runs::RunService::load_from_path(path);
     }
 
     #[cfg(unix)]
@@ -1025,11 +963,7 @@ impl App {
         } else {
             state::Mode::Navigate
         };
-        let (run_registry, run_registry_path, run_registry_load_error) =
-            Self::load_run_registry(false);
-        app.run_registry = run_registry;
-        app.run_registry_path = run_registry_path;
-        app.run_registry_load_error = run_registry_load_error;
+        app.run_service = crate::server::runs::RunService::load(false);
         app.reconcile_run_registry_after_startup();
         app.last_focus = app.state.active.and_then(|idx| {
             app.state
@@ -1803,13 +1737,6 @@ impl App {
             diagnostics,
         }
     }
-}
-
-fn run_registry_now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------

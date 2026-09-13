@@ -1,153 +1,25 @@
-//! Durable-run API binding checks.
-//!
-//! This module owns the boundary from API values to server-owned run bindings.
-
-use bytes::Bytes;
-
-#[cfg(test)]
-use std::cell::RefCell;
-#[cfg(test)]
-use std::collections::VecDeque;
+//! Adapts current session identities and terminal access to the server run service.
 
 use crate::api::schema::{
-    ResponseResult, RunCancelParams, RunCapabilityIssueParams, RunStatusParams, RunSubmitParams,
+    RunCancelParams, RunCapabilityIssueParams, RunStatusParams, RunSubmitParams,
 };
-use crate::runs::{
-    auth::{CapabilityRef, RunOperation},
-    RunAgentObservation, RunBinding, RunError, RunFailureKind, RunObservationBinding, RunRecord,
-    RunRegistry, RunState, RunSubmission,
-};
-
-use super::responses::{encode_error, encode_success};
-
-const MAX_RUN_REQUEST_ID_BYTES: usize = 128;
-const INVALID_RUN_REQUEST_ID: &str = "invalid-run-request-id";
-const AGENT_PROMPT_SUBMIT_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
-
 #[cfg(test)]
-thread_local! {
-    static TEST_RUN_CLOCK: RefCell<VecDeque<u64>> = const { RefCell::new(VecDeque::new()) };
-}
+use crate::runs::RunRegistry;
+use crate::runs::{RunAgentObservation, RunError, RunRecord};
+#[cfg(test)]
+use crate::server::runs::AGENT_PROMPT_SUBMIT_DELAY;
+use crate::server::runs::{
+    validate_run_binding, LiveRunTarget, RequestedRunBinding, ResolvedRunBinding, RunHost,
+    RunService,
+};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LiveRunTarget {
-    binding: ResolvedRunBinding,
-    workspace_index: usize,
-    pane_id: crate::layout::PaneId,
-}
-
-/// Full identity resolved from the current workspace and pane state.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ResolvedRunBinding {
-    pub workspace_id: String,
-    pub checkout_path: String,
-    pub pane_id: String,
-    pub agent_name: String,
-    pub agent_session_id: String,
-}
-
-/// Full identity supplied by a durable-run submit request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct RequestedRunBinding {
-    pub workspace_id: String,
-    pub checkout_path: String,
-    pub pane_id: String,
-    pub agent_name: String,
-    pub agent_session_id: String,
-}
-
-/// Validate that a caller targets the exact live workspace and agent binding.
-pub(super) fn validate_run_binding(
-    requested: &RequestedRunBinding,
-    resolved: &ResolvedRunBinding,
-) -> Result<(), RunError> {
-    if requested.workspace_id != resolved.workspace_id
-        || requested.checkout_path != resolved.checkout_path
-    {
-        return Err(RunError::CheckoutMismatch);
+impl RunHost for crate::app::App {
+    fn has_workspace(&self, workspace_id: &str) -> bool {
+        self.state
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == workspace_id)
     }
-    if requested.pane_id != resolved.pane_id
-        || requested.agent_name != resolved.agent_name
-        || requested.agent_session_id != resolved.agent_session_id
-    {
-        return Err(RunError::TargetUnavailable);
-    }
-    Ok(())
-}
-
-impl crate::app::App {
-    fn run_now_unix() -> u64 {
-        #[cfg(test)]
-        if let Some(now_unix) = TEST_RUN_CLOCK.with(|clock| clock.borrow_mut().pop_front()) {
-            return now_unix;
-        }
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_secs())
-            .unwrap_or(0)
-    }
-
-    #[cfg(test)]
-    fn set_run_clock_for_test(values: impl IntoIterator<Item = u64>) {
-        TEST_RUN_CLOCK.with(|clock| {
-            *clock.borrow_mut() = values.into_iter().collect();
-        });
-    }
-
-    fn bounded_run_request_id(id: String) -> String {
-        if id.len() <= MAX_RUN_REQUEST_ID_BYTES {
-            id
-        } else {
-            INVALID_RUN_REQUEST_ID.to_string()
-        }
-    }
-
-    fn run_error(id: String, error: RunError) -> String {
-        let id = Self::bounded_run_request_id(id);
-        encode_error(id, error.code(), error.message())
-    }
-
-    fn run_success(id: String, result: ResponseResult) -> String {
-        let id = Self::bounded_run_request_id(id);
-        let response = encode_success(id.clone(), result);
-        if response.len() <= crate::runs::MAX_RUN_RESULT_BYTES {
-            response
-        } else {
-            encode_error(
-                id,
-                "run_invalid_request",
-                "run response exceeds supported bounds",
-            )
-        }
-    }
-
-    fn persist_run_registry(&mut self, next: RunRegistry) -> Result<(), RunError> {
-        if self.run_registry_load_error.is_some() {
-            return Err(RunError::PersistenceUnavailable);
-        }
-        let Some(path) = self.run_registry_path.clone() else {
-            return Err(RunError::PersistenceUnavailable);
-        };
-        crate::persist::run_registry::save_to_path(&path, &next)
-            .map_err(|_| RunError::PersistenceUnavailable)?;
-        self.run_registry = next;
-        Ok(())
-    }
-
-    fn mutate_run_registry<T>(
-        &mut self,
-        mutation: impl FnOnce(&mut RunRegistry) -> Result<T, RunError>,
-    ) -> Result<T, RunError> {
-        let mut next = self.run_registry.clone();
-        let result = mutation(&mut next);
-        if next != self.run_registry {
-            self.persist_run_registry(next)?;
-        } else if self.run_registry_load_error.is_some() || self.run_registry_path.is_none() {
-            return Err(RunError::PersistenceUnavailable);
-        }
-        result
-    }
-
     fn live_run_target(&self, requested: &RequestedRunBinding) -> Result<LiveRunTarget, RunError> {
         let Some(workspace_index) = self
             .state
@@ -211,21 +83,8 @@ impl crate::app::App {
         })
     }
 
-    fn record_requested_binding(record: &RunRecord) -> Result<RequestedRunBinding, RunError> {
-        let Some(agent_name) = record.agent_name.clone() else {
-            return Err(RunError::TargetUnavailable);
-        };
-        Ok(RequestedRunBinding {
-            workspace_id: record.workspace_id.clone(),
-            checkout_path: record.checkout_path.clone(),
-            pane_id: record.pane_id.clone(),
-            agent_name,
-            agent_session_id: record.agent_session_id.clone(),
-        })
-    }
-
     fn run_observation(&self, record: &RunRecord) -> Option<RunAgentObservation> {
-        let requested = Self::record_requested_binding(record).ok()?;
+        let requested = RunService::record_requested_binding(record).ok()?;
         let target = self.live_run_target(&requested).ok()?;
         if self
             .lookup_runtime_sender(target.workspace_index, target.pane_id)
@@ -244,32 +103,30 @@ impl crate::app::App {
         }
     }
 
-    fn observe_run_or_mark_lost(
+    fn lookup_runtime_sender(
         &self,
-        registry: &mut RunRegistry,
-        record: &RunRecord,
-        now_unix: u64,
-    ) {
-        let requested = match Self::record_requested_binding(record) {
-            Ok(requested) => requested,
-            Err(_) => return,
-        };
-        let observation = match self.run_observation(record) {
-            Some(observation) => observation,
-            None if self.live_run_target(&requested).is_err() => RunAgentObservation::Gone,
-            None => return,
-        };
-        let binding = RunObservationBinding {
-            workspace_id: record.workspace_id.clone(),
-            checkout_path: record.checkout_path.clone(),
-            pane_id: record.pane_id.clone(),
-            agent_name: record.agent_name.clone(),
-            agent_session_id: record.agent_session_id.clone(),
-        };
-        if observation == RunAgentObservation::Working && record.state == RunState::Queued {
-            let _ = registry.mark_started(&record.run_id, now_unix);
-        }
-        let _ = registry.observe_agent_state(&binding, observation, now_unix);
+        workspace_index: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<&crate::terminal::TerminalRuntime> {
+        crate::app::App::lookup_runtime_sender(self, workspace_index, pane_id)
+    }
+
+    fn target_ready_for_submit(&self, target: &LiveRunTarget) -> bool {
+        let workspace = &self.state.workspaces[target.workspace_index];
+        workspace
+            .terminal_id(target.pane_id)
+            .and_then(|id| self.state.terminals.get(id))
+            .is_some_and(|terminal| terminal.state == crate::detect::AgentState::Idle)
+    }
+}
+
+impl crate::app::App {
+    // Dispatch is synchronous. Move the service out while the adapter borrows runtime facts.
+    fn with_run_service<T>(&mut self, operation: impl FnOnce(&mut RunService, &Self) -> T) -> T {
+        let mut service = std::mem::take(&mut self.run_service);
+        let result = operation(&mut service, self);
+        self.run_service = service;
+        result
     }
 
     pub(super) fn handle_run_capability_issue(
@@ -277,305 +134,22 @@ impl crate::app::App {
         id: String,
         params: RunCapabilityIssueParams,
     ) -> String {
-        if !self
-            .state
-            .workspaces
-            .iter()
-            .any(|workspace| workspace.id == params.workspace_id)
-        {
-            return Self::run_error(id, RunError::NotFound);
-        }
-        match self.mutate_run_registry(|registry| {
-            registry.issue_capability(
-                &params.workspace_id,
-                params.ttl_ms,
-                &params.operations,
-                Self::run_now_unix(),
-            )
-        }) {
-            Ok(capability) => {
-                Self::run_success(id, ResponseResult::RunCapabilityIssued { capability })
-            }
-            Err(error) => Self::run_error(id, error),
-        }
+        self.with_run_service(|service, host| service.handle_run_capability_issue(id, params, host))
     }
-
     pub(super) fn handle_run_status(&mut self, id: String, params: RunStatusParams) -> String {
-        let now_unix = Self::run_now_unix();
-        let mut next = self.run_registry.clone();
-        let result = (|| {
-            let scope = next.authorize(
-                &CapabilityRef {
-                    capability_id: params.capability.capability_id.clone(),
-                    sequence: params.capability.sequence,
-                },
-                RunOperation::Status,
-                now_unix,
-            )?;
-            let record = next.get(&params.run_id, &scope)?.clone();
-            self.observe_run_or_mark_lost(&mut next, &record, now_unix);
-            next.get(&params.run_id, &scope).cloned()
-        })();
-        let persisted = if next != self.run_registry {
-            self.persist_run_registry(next)
-        } else if self.run_registry_load_error.is_some() || self.run_registry_path.is_none() {
-            Err(RunError::PersistenceUnavailable)
-        } else {
-            Ok(())
-        };
-        match (result, persisted) {
-            (_, Err(error)) => Self::run_error(id, error),
-            (Ok(run), Ok(())) => Self::run_success(id, ResponseResult::RunStatus { run }),
-            (Err(error), Ok(())) => Self::run_error(id, error),
-        }
+        self.with_run_service(|service, host| service.handle_run_status(id, params, host))
     }
-
     pub(super) fn handle_run_submit(&mut self, id: String, params: RunSubmitParams) -> String {
-        let requested = RequestedRunBinding {
-            workspace_id: params.workspace_id.clone(),
-            checkout_path: params.checkout.path.clone(),
-            pane_id: params.target.pane_id.clone(),
-            agent_name: params.target.agent_name.clone(),
-            agent_session_id: params.target.agent_session_id.clone(),
-        };
-        let target = match self.live_run_target(&requested) {
-            Ok(target) => target,
-            Err(error) => return Self::run_error(id, error),
-        };
-        let now_unix = Self::run_now_unix();
-        let mut next = self.run_registry.clone();
-        let outcome = (|| {
-            let scope = next.authorize(
-                &CapabilityRef {
-                    capability_id: params.capability.capability_id.clone(),
-                    sequence: params.capability.sequence,
-                },
-                RunOperation::Submit,
-                now_unix,
-            )?;
-            if scope.workspace_id != requested.workspace_id {
-                return Err(RunError::NotFound);
-            }
-            next.submit(
-                &RunSubmission {
-                    idempotency_key: params.idempotency_key.clone(),
-                    prompt: params.prompt.clone(),
-                    binding: RunBinding {
-                        workspace_id: target.binding.workspace_id.clone(),
-                        checkout_path: target.binding.checkout_path.clone(),
-                        pane_id: target.binding.pane_id.clone(),
-                        agent_name: Some(target.binding.agent_name.clone()),
-                        agent_session_id: target.binding.agent_session_id.clone(),
-                    },
-                },
-                now_unix,
-            )
-        })();
-        if next != self.run_registry {
-            if let Err(error) = self.persist_run_registry(next) {
-                return Self::run_error(id, error);
-            }
-        } else if self.run_registry_load_error.is_some() || self.run_registry_path.is_none() {
-            return Self::run_error(id, RunError::PersistenceUnavailable);
-        }
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
-            Err(error) => return Self::run_error(id, error),
-        };
-        if outcome.deduplicated {
-            return Self::run_success(
-                id,
-                ResponseResult::RunSubmitted {
-                    run: outcome.record,
-                    deduplicated: true,
-                },
-            );
-        }
-
-        let enter = match self.lookup_runtime_sender(target.workspace_index, target.pane_id) {
-            Some(runtime) => {
-                let (text, enter) =
-                    crate::app::api_helpers::encode_api_submission_parts(runtime, &params.prompt);
-                if runtime.try_send_bytes(Bytes::from(text)).is_err() {
-                    return self.finish_failed_submission(id, outcome.record, now_unix);
-                }
-                enter
-            }
-            None => {
-                return self.finish_failed_submission(id, outcome.record, now_unix);
-            }
-        };
-        let mut running = self.run_registry.clone();
-        let Some(run) = running.mark_started(&outcome.record.run_id, now_unix) else {
-            return Self::run_error(id, RunError::PersistenceUnavailable);
-        };
-        if let Err(error) = self.persist_run_registry(running) {
-            return Self::run_error(id, error);
-        }
-        let Some(runtime) = self.lookup_runtime_sender(target.workspace_index, target.pane_id)
-        else {
-            return self.finish_failed_submission(id, outcome.record, now_unix);
-        };
-        runtime.schedule_run_bytes_after(
-            outcome.record.run_id.clone(),
-            Bytes::from(enter),
-            AGENT_PROMPT_SUBMIT_DELAY,
-        );
-        Self::run_success(
-            id,
-            ResponseResult::RunSubmitted {
-                run,
-                deduplicated: false,
-            },
-        )
+        self.with_run_service(|service, host| service.handle_run_submit(id, params, host))
     }
-
-    fn finish_failed_submission(&mut self, id: String, record: RunRecord, now_unix: u64) -> String {
-        let mut failed = self.run_registry.clone();
-        let Some(_) = failed.mark_failed(&record.run_id, RunFailureKind::PromptRejected, now_unix)
-        else {
-            return Self::run_error(id, RunError::PersistenceUnavailable);
-        };
-        match self.persist_run_registry(failed) {
-            Ok(()) => Self::run_error(id, RunError::TargetUnavailable),
-            Err(error) => Self::run_error(id, error),
-        }
-    }
-
-    pub(super) fn mark_closed_runs_lost(&mut self, workspace_id: &str, pane_id: Option<&str>) {
-        let now_unix = Self::run_now_unix();
-        let mut next = self.run_registry.clone();
-        let lost = match pane_id {
-            Some(pane_id) => next.mark_lost_for_closed_pane(workspace_id, pane_id, now_unix),
-            None => next.mark_lost_for_closed_workspace(workspace_id, now_unix),
-        };
-        if lost.is_empty() {
-            return;
-        }
-        if let Err(error) = self.persist_run_registry(next) {
-            tracing::warn!(
-                error_code = error.code(),
-                "durable run reconciliation did not persist before close"
-            );
-        }
-    }
-
     pub(super) fn handle_run_cancel(&mut self, id: String, params: RunCancelParams) -> String {
-        let now_unix = Self::run_now_unix();
-        let mut pending = self.run_registry.clone();
-        // Snapshot the registry immediately after `authorize()` burns the
-        // capability's replay-protection sequence, before `request_cancel`
-        // below mutates the run record. If the interrupt later fails to
-        // send, we revert to exactly this snapshot: the sequence burn from
-        // a genuinely successful authorization must remain permanent (a
-        // capability+sequence pair may never be replayed), even though the
-        // run's `CancelRequested` transition itself gets undone.
-        let mut authorized_registry: Option<RunRegistry> = None;
-        // Resolve everything needed to actually deliver the interrupt first
-        // (authorization, the target run's cancellability, the live pane,
-        // and the encoded Ctrl-C bytes), and only once delivery is truly
-        // about to be attempted, commit the `CancelRequested` transition into
-        // `pending`. An interrupt is a real-world action we cannot take
-        // back, so the durable record must already reflect the attempt
-        // before we make it -- not persisted afterward, where a failed save
-        // would leave a delivered interrupt with no durable trace of it.
-        let prepared = (|| {
-            let scope = pending.authorize(
-                &CapabilityRef {
-                    capability_id: params.capability.capability_id.clone(),
-                    sequence: params.capability.sequence,
-                },
-                RunOperation::Cancel,
-                now_unix,
-            )?;
-            authorized_registry = Some(pending.clone());
-            let record = pending.get(&params.run_id, &scope)?.clone();
-            let requested = Self::record_requested_binding(&record)?;
-            let target = self.live_run_target(&requested)?;
-            let Some(runtime) = self.lookup_runtime_sender(target.workspace_index, target.pane_id)
-            else {
-                return Err(RunError::TargetUnavailable);
-            };
-            let encoded =
-                match crate::app::api_helpers::encode_api_keys(runtime, &["ctrl+c".to_string()]) {
-                    Ok(mut keys) => keys.pop(),
-                    Err(_) => None,
-                };
-            let Some(encoded) = encoded else {
-                return Err(RunError::TargetUnavailable);
-            };
-            let run = pending.request_cancel(&params.run_id, &scope, now_unix)?;
-            Ok::<_, RunError>((run, target.workspace_index, target.pane_id, encoded))
-        })();
-        if pending != self.run_registry {
-            if let Err(error) = self.persist_run_registry(pending) {
-                return Self::run_error(id, error);
-            }
-        } else if self.run_registry_load_error.is_some() || self.run_registry_path.is_none() {
-            return Self::run_error(id, RunError::PersistenceUnavailable);
-        }
-        let (run, workspace_index, pane_id, encoded) = match prepared {
-            Ok(prepared) => prepared,
-            Err(error) => return Self::run_error(id, error),
-        };
-        let Some(runtime) = self.lookup_runtime_sender(workspace_index, pane_id) else {
-            return Self::run_error(id, RunError::TargetUnavailable);
-        };
-        // Suppressing the scheduled Enter and sending the interrupt are
-        // serialized inside the runtime: cancellation either fully prevents
-        // the delayed Enter or waits for it to finish landing first, so the
-        // interrupt below can never be followed by a stray Enter.
-        runtime.cancel_scheduled_run_input(&params.run_id);
-        if runtime.try_send_bytes(Bytes::from(encoded)).is_err() {
-            // The interrupt never reached the pane: compensate by reverting
-            // just the `CancelRequested` transition (back to the state
-            // captured right after authorization) so the durable record
-            // stays truthful and this run remains retryable, without
-            // un-burning the capability sequence that authorize() already
-            // permanently consumed.
-            let reverted = authorized_registry
-                .expect("authorized_registry is set once authorize() succeeds, which it must have for `prepared` to reach this branch");
-            if !self.revert_run_registry_after_failed_interrupt(reverted) {
-                return Self::run_error(id, RunError::PersistenceUnavailable);
-            }
-            return Self::run_error(id, RunError::TargetUnavailable);
-        }
-        Self::run_success(id, ResponseResult::RunCancelRequested { run })
+        self.with_run_service(|service, host| service.handle_run_cancel(id, params, host))
     }
-
-    /// Revert the durable registry to `reverted` after a delivered-but-
-    /// unwritten interrupt, so a run never stays durably `CancelRequested`
-    /// with no interrupt actually in flight.
-    ///
-    /// Returns `true` once the revert itself is durable. If the revert save
-    /// fails, the just-persisted `CancelRequested` cannot be undone and
-    /// cannot be trusted either: rather than leave that durable lie standing
-    /// with only a log line, this disables every future run operation
-    /// (`run_registry_load_error`) the same way a corrupt or unreadable
-    /// registry does at startup, so the inconsistency is surfaced to every
-    /// caller instead of silently going unnoticed.
-    fn revert_run_registry_after_failed_interrupt(&mut self, reverted: RunRegistry) -> bool {
-        let Some(path) = self.run_registry_path.clone() else {
-            return true;
-        };
-        match crate::persist::run_registry::save_to_path(&path, &reverted) {
-            Ok(()) => {
-                self.run_registry = reverted;
-                true
-            }
-            Err(_) => {
-                tracing::error!(
-                    "failed to revert a durably-persisted cancellation after the interrupt write \
-                     failed; disabling durable run operations until this is investigated"
-                );
-                self.run_registry_load_error =
-                    Some("durable run registry is unavailable".to_string());
-                false
-            }
-        }
+    pub(super) fn mark_closed_runs_lost(&mut self, workspace_id: &str, pane_id: Option<&str>) {
+        self.run_service
+            .mark_closed_runs_lost(workspace_id, pane_id);
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,7 +232,7 @@ mod tests {
 
     fn seed_status_run(temp: &TempRegistry, workspace_id: &str) -> (RunRegistry, String, String) {
         let mut registry = RunRegistry::default();
-        let now_unix = crate::app::App::run_now_unix();
+        let now_unix = RunService::run_now_unix();
         let run_id = registry
             .submit(
                 &RunSubmission {
@@ -745,8 +319,8 @@ mod tests {
         }
 
         fn seed_run(&mut self, key: &str, state: RunState) -> RunRecord {
-            let now_unix = crate::app::App::run_now_unix();
-            let mut registry = self.app.run_registry.clone();
+            let now_unix = RunService::run_now_unix();
+            let mut registry = self.app.run_service.run_registry.clone();
             let record = registry
                 .submit(
                     &RunSubmission {
@@ -787,14 +361,16 @@ mod tests {
             }
             crate::persist::run_registry::save_to_path(
                 self.app
+                    .run_service
                     .run_registry_path
                     .as_deref()
                     .expect("temporary registry path"),
                 &registry,
             )
             .expect("persist seeded run");
-            self.app.run_registry = registry;
+            self.app.run_service.run_registry = registry;
             self.app
+                .run_service
                 .run_registry
                 .records()
                 .iter()
@@ -848,7 +424,7 @@ mod tests {
         terminal.set_agent_name("reviewer".to_string());
         terminal.set_detected_state(
             Some(crate::detect::Agent::Codex),
-            crate::detect::AgentState::Working,
+            crate::detect::AgentState::Idle,
         );
         terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
             source: "herdr:codex".to_string(),
@@ -861,6 +437,7 @@ mod tests {
         let pane_id = app.public_pane_id(0, pane).expect("public pane id");
         app.set_run_registry_path_for_test(temp.path.clone());
 
+        app.state.assert_invariants_for_test();
         LiveRunFixture {
             app,
             prompt_rx: Some(prompt_rx),
@@ -878,6 +455,174 @@ mod tests {
             capability_id: "cap_1".to_string(),
             sequence,
         }
+    }
+
+    #[tokio::test]
+    async fn submit_rejects_a_busy_agent_without_writing_prompt_bytes() {
+        for state in [
+            crate::detect::AgentState::Working,
+            crate::detect::AgentState::Blocked,
+            crate::detect::AgentState::Unknown,
+        ] {
+            let temp = TempRegistry::new("submit-busy");
+            let mut fixture = live_run_fixture(&temp);
+            fixture
+                .app
+                .state
+                .terminals
+                .get_mut(&fixture.terminal_id)
+                .expect("terminal")
+                .set_detected_state(Some(crate::detect::Agent::Codex), state);
+            let capability = fixture.issue_capability(vec![RunOperation::Submit]);
+            let submitted = fixture.request(
+                "busy",
+                Method::RunSubmit(fixture.submit_params(capability, "busy", "review")),
+            );
+            assert_eq!(submitted["error"]["code"], "run_target_unavailable");
+            assert!(fixture
+                .prompt_rx
+                .as_mut()
+                .expect("receiver")
+                .try_recv()
+                .is_err());
+            assert!(fixture.app.run_service.run_registry.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_retry_keeps_the_existing_run_when_its_agent_is_busy() {
+        let temp = TempRegistry::new("retry-busy");
+        let mut fixture = live_run_fixture(&temp);
+        let run = fixture.seed_run("retry", RunState::Running);
+        fixture
+            .app
+            .state
+            .terminals
+            .get_mut(&fixture.terminal_id)
+            .expect("terminal")
+            .set_detected_state(
+                Some(crate::detect::Agent::Codex),
+                crate::detect::AgentState::Working,
+            );
+        let capability = fixture.issue_capability(vec![RunOperation::Submit]);
+        let repeated = fixture.request(
+            "retry",
+            Method::RunSubmit(fixture.submit_params(capability, "retry", "seed prompt")),
+        );
+        assert_eq!(repeated["result"]["deduplicated"], true);
+        assert_eq!(repeated["result"]["run"]["run_id"], run.run_id);
+        assert_eq!(repeated["result"]["run"]["state"], "running");
+        assert!(fixture
+            .prompt_rx
+            .as_mut()
+            .expect("receiver")
+            .try_recv()
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn retry_after_cancelled_enter_and_failed_interrupt_recovers_delivery() {
+        let temp = TempRegistry::new("retry-cancelled-enter");
+        let mut fixture = live_run_fixture(&temp);
+        fixture
+            .app
+            .state
+            .terminals
+            .get_mut(&fixture.terminal_id)
+            .expect("terminal")
+            .set_detected_state(
+                Some(crate::detect::Agent::Codex),
+                crate::detect::AgentState::Idle,
+            );
+        let capability = fixture.issue_capability(vec![RunOperation::Submit, RunOperation::Cancel]);
+        let submitted = fixture.request(
+            "submit",
+            Method::RunSubmit(fixture.submit_params(capability.clone(), "retry", "review")),
+        );
+        assert_result_type(&submitted, "run_submitted");
+        let run_id = submitted["result"]["run"]["run_id"]
+            .as_str()
+            .expect("run id")
+            .to_string();
+        let (_, pane_id) = fixture
+            .app
+            .parse_current_public_pane_id(&fixture.pane_id)
+            .expect("pane");
+        let runtime = fixture
+            .app
+            .lookup_runtime_sender(0, pane_id)
+            .expect("runtime");
+        while runtime
+            .try_send_bytes(Bytes::from_static(b"filled"))
+            .is_ok()
+        {}
+        let cancelled = fixture.request(
+            "cancel",
+            Method::RunCancel(RunCancelParams {
+                capability: RunCapabilityRef {
+                    sequence: 2,
+                    ..capability.clone()
+                },
+                run_id,
+            }),
+        );
+        assert_eq!(cancelled["error"]["code"], "run_target_unavailable");
+        while fixture
+            .prompt_rx
+            .as_mut()
+            .expect("receiver")
+            .try_recv()
+            .is_ok()
+        {}
+        let repeated = fixture.request(
+            "retry",
+            Method::RunSubmit(fixture.submit_params(
+                RunCapabilityRef {
+                    sequence: 3,
+                    ..capability.clone()
+                },
+                "retry",
+                "review",
+            )),
+        );
+        assert_eq!(repeated["result"]["deduplicated"], true);
+        assert_eq!(repeated["result"]["run"]["state"], "running");
+        let competing = fixture.request(
+            "competing",
+            Method::RunSubmit(fixture.submit_params(
+                RunCapabilityRef {
+                    sequence: 4,
+                    ..capability
+                },
+                "different-key",
+                "new prompt",
+            )),
+        );
+        assert_eq!(competing["error"]["code"], "run_binding_busy");
+        let enter = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            fixture.prompt_rx.as_mut().expect("receiver").recv(),
+        )
+        .await
+        .expect("recovered Enter must arrive")
+        .expect("Enter bytes");
+        assert_eq!(enter, Bytes::from_static(b"\r"));
+        assert!(fixture
+            .prompt_rx
+            .as_mut()
+            .expect("receiver")
+            .try_recv()
+            .is_err());
+        let persisted = crate::persist::run_registry::load_from_path(&temp.path).expect("registry");
+        assert_eq!(persisted.records()[0].state, RunState::Running);
+    }
+
+    #[test]
+    fn durable_run_ownership_is_outside_the_tui_app() {
+        let app_source = include_str!("../mod.rs");
+        assert!(!app_source.contains("pub(crate) run_registry:"));
+        assert!(!app_source.contains("fn load_run_registry("));
+        assert!(!app_source.contains("reconcile_after_restart_with_bindings("));
     }
 
     fn resolved() -> ResolvedRunBinding {
@@ -1139,23 +884,26 @@ mod tests {
         let mut app = app();
         app.state.workspaces = vec![crate::workspace::Workspace::test_new("run-api")];
         let workspace_id = app.state.workspaces[0].id.clone();
-        assert!(app.run_registry_path.is_none());
-        assert!(app.run_registry_load_error.is_none());
+        assert!(app.run_service.run_registry_path.is_none());
+        assert!(app.run_service.run_registry_load_error.is_none());
 
         let result = response(
             app.handle_run_capability_issue("no-session".to_string(), issue_params(workspace_id)),
         );
         assert_eq!(result["id"], "no-session");
         assert_eq!(result["error"]["code"], "run_persistence_unavailable");
-        assert!(app.run_registry.is_empty());
+        assert!(app.run_service.run_registry.is_empty());
     }
 
     #[test]
     fn injected_missing_path_is_ready_and_never_uses_user_configuration() {
         let temp = TempRegistry::new("missing");
         let (app, _) = app_with_workspace_and_path(&temp);
-        assert_eq!(app.run_registry.len(), 0);
-        assert_eq!(app.run_registry_path.as_deref(), Some(temp.path.as_path()));
+        assert_eq!(app.run_service.run_registry.len(), 0);
+        assert_eq!(
+            app.run_service.run_registry_path.as_deref(),
+            Some(temp.path.as_path())
+        );
         assert!(!temp.path.starts_with(crate::config::config_dir()));
     }
 
@@ -1168,9 +916,10 @@ mod tests {
             .expect("capability");
         crate::persist::run_registry::save_to_path(&valid.path, &registry).expect("save valid");
         let (app, _) = app_with_workspace_and_path(&valid);
-        assert_eq!(app.run_registry, registry);
-        assert!(app.run_registry_load_error.is_none());
+        assert_eq!(app.run_service.run_registry, registry);
+        assert!(app.run_service.run_registry_load_error.is_none());
         assert!(!app
+            .run_service
             .run_registry_path
             .as_deref()
             .expect("test registry path")
@@ -1195,7 +944,7 @@ mod tests {
                         agent_session_id: "different-session".to_string(),
                     },
                 },
-                crate::app::App::run_now_unix(),
+                RunService::run_now_unix(),
             )
             .expect("restored run")
             .record;
@@ -1216,7 +965,7 @@ mod tests {
             .expect("restored record");
         assert_eq!(restored.state, RunState::Lost);
         assert_eq!(restored.failure, Some(RunFailureKind::ServerRestart));
-        assert!(fixture.app.run_registry_load_error.is_none());
+        assert!(fixture.app.run_service.run_registry_load_error.is_none());
     }
 
     fn assert_disabled_run_methods(mut app: crate::app::App, workspace_id: String) {
@@ -1242,7 +991,7 @@ mod tests {
         let temp = TempRegistry::new("corrupt");
         std::fs::write(&temp.path, b"not-json").expect("corrupt registry");
         let (app, workspace_id) = app_with_workspace_and_path(&temp);
-        assert!(app.run_registry_load_error.is_some());
+        assert!(app.run_service.run_registry_load_error.is_some());
         assert_disabled_run_methods(app, workspace_id);
     }
 
@@ -1251,7 +1000,7 @@ mod tests {
         let temp = TempRegistry::new("future");
         std::fs::write(&temp.path, br#"{"version":999,"runs":[]}"#).expect("future registry");
         let (app, workspace_id) = app_with_workspace_and_path(&temp);
-        assert!(app.run_registry_load_error.is_some());
+        assert!(app.run_service.run_registry_load_error.is_some());
         assert_disabled_run_methods(app, workspace_id);
     }
 
@@ -1263,13 +1012,13 @@ mod tests {
         let failed_path = blocked_parent.join("runs.json");
         let (mut app, workspace_id) = app_with_workspace_and_path(&temp);
         app.set_run_registry_path_for_test(failed_path);
-        let before = app.run_registry.clone();
+        let before = app.run_service.run_registry.clone();
 
         let result = response(
             app.handle_run_capability_issue("save-failure".to_string(), issue_params(workspace_id)),
         );
         assert_eq!(result["error"]["code"], "run_persistence_unavailable");
-        assert_eq!(app.run_registry, before);
+        assert_eq!(app.run_service.run_registry, before);
     }
 
     #[test]
@@ -1284,7 +1033,7 @@ mod tests {
         ));
         assert_eq!(result["id"], "workspace-required");
         assert_eq!(result["error"]["code"], "run_not_found");
-        assert!(app.run_registry.is_empty());
+        assert!(app.run_service.run_registry.is_empty());
     }
 
     #[test]
@@ -1299,7 +1048,7 @@ mod tests {
         assert_eq!(result["result"]["type"], "run_capability_issued");
         let persisted = crate::persist::run_registry::load_from_path(&temp.path)
             .expect("persisted capability registry");
-        assert_eq!(persisted, app.run_registry);
+        assert_eq!(persisted, app.run_service.run_registry);
     }
 
     #[test]
@@ -1331,7 +1080,7 @@ mod tests {
                     sequence: 1,
                 },
                 RunOperation::Status,
-                crate::app::App::run_now_unix(),
+                RunService::run_now_unix(),
             ),
             Err(RunError::ReplayRejected)
         );
@@ -1448,7 +1197,7 @@ mod tests {
         assert_eq!(submitted["result"]["run"]["state"], "running");
         let persisted = crate::persist::run_registry::load_from_path(&temp.path)
             .expect("running submission is durable");
-        assert_eq!(persisted, fixture.app.run_registry);
+        assert_eq!(persisted, fixture.app.run_service.run_registry);
         assert_eq!(
             fixture
                 .prompt_rx
@@ -1466,12 +1215,12 @@ mod tests {
         let mut fixture = live_run_fixture(&temp);
         let capability = fixture.issue_capability(vec![RunOperation::Submit]);
 
-        crate::app::App::set_run_clock_for_test([1_700_000_000, 1_700_000_001]);
+        RunService::set_run_clock_for_test([1_700_000_000, 1_700_000_001]);
         let submitted = fixture.request(
             "submit-clock",
             Method::RunSubmit(fixture.submit_params(capability, "single-clock", "review")),
         );
-        crate::app::App::set_run_clock_for_test([]);
+        RunService::set_run_clock_for_test([]);
 
         assert_result_type(&submitted, "run_submitted");
         assert_eq!(submitted["result"]["run"]["created_at_unix"], 1_700_000_000);
@@ -1592,7 +1341,10 @@ mod tests {
 
             let rejected = fixture.request("mismatch", Method::RunSubmit(params));
             assert_eq!(rejected["error"]["code"], expected, "mismatch: {mismatch}");
-            assert!(fixture.app.run_registry.is_empty(), "mismatch: {mismatch}");
+            assert!(
+                fixture.app.run_service.run_registry.is_empty(),
+                "mismatch: {mismatch}"
+            );
             assert!(fixture
                 .prompt_rx
                 .as_mut()
@@ -1609,14 +1361,14 @@ mod tests {
         std::fs::write(&blocked_parent, b"block registry save").expect("blocked registry parent");
         let mut fixture = live_run_fixture(&temp);
         let capability = fixture.issue_capability(vec![RunOperation::Submit]);
-        fixture.app.run_registry_path = Some(blocked_parent.join("runs.json"));
+        fixture.app.run_service.run_registry_path = Some(blocked_parent.join("runs.json"));
 
         let rejected = fixture.request(
             "submit",
             Method::RunSubmit(fixture.submit_params(capability, "save-failure", "review")),
         );
         assert_eq!(rejected["error"]["code"], "run_persistence_unavailable");
-        assert!(fixture.app.run_registry.is_empty());
+        assert!(fixture.app.run_service.run_registry.is_empty());
         assert!(fixture
             .prompt_rx
             .as_mut()
@@ -1705,8 +1457,8 @@ mod tests {
             .app
             .public_pane_id(0, second_pane)
             .expect("second public pane id");
-        let now_unix = crate::app::App::run_now_unix();
-        let mut registry = fixture.app.run_registry.clone();
+        let now_unix = RunService::run_now_unix();
+        let mut registry = fixture.app.run_service.run_registry.clone();
         let second = registry
             .submit(
                 &RunSubmission {
@@ -1726,7 +1478,7 @@ mod tests {
             .record;
         crate::persist::run_registry::save_to_path(&temp.path, &registry)
             .expect("persist second seeded run");
-        fixture.app.run_registry = registry;
+        fixture.app.run_service.run_registry = registry;
         let capability = fixture.issue_capability(vec![RunOperation::Cancel]);
 
         let cancelled = fixture.request(
@@ -1751,6 +1503,7 @@ mod tests {
         assert_eq!(
             fixture
                 .app
+                .run_service
                 .run_registry
                 .records()
                 .iter()
@@ -1891,7 +1644,7 @@ mod tests {
         let capability = fixture.issue_capability(vec![RunOperation::Cancel]);
         let blocked_parent = temp.directory.join("not-a-directory");
         std::fs::write(&blocked_parent, b"block registry save").expect("blocked registry parent");
-        fixture.app.run_registry_path = Some(blocked_parent.join("runs.json"));
+        fixture.app.run_service.run_registry_path = Some(blocked_parent.join("runs.json"));
 
         let cancelled = fixture.request(
             "cancel",
@@ -1944,7 +1697,7 @@ mod tests {
                     sequence: capability.sequence,
                 },
                 RunOperation::Cancel,
-                crate::app::App::run_now_unix(),
+                RunService::run_now_unix(),
             ),
             Err(RunError::ReplayRejected),
             "a capability sequence consumed by a genuinely successful authorize() must stay \
@@ -1961,23 +1714,25 @@ mod tests {
     fn failed_compensating_revert_disables_durable_run_operations_instead_of_lying() {
         let temp = TempRegistry::new("cancel-revert-save-failure");
         let (mut app, _workspace_id) = app_with_workspace_and_path(&temp);
-        let before = app.run_registry.clone();
+        let before = app.run_service.run_registry.clone();
         let blocked_parent = temp.directory.join("not-a-directory");
         std::fs::write(&blocked_parent, b"block registry save").expect("blocked registry parent");
-        app.run_registry_path = Some(blocked_parent.join("runs.json"));
+        app.run_service.run_registry_path = Some(blocked_parent.join("runs.json"));
 
-        let reverted_ok = app.revert_run_registry_after_failed_interrupt(RunRegistry::default());
+        let reverted_ok = app
+            .run_service
+            .revert_run_registry_after_failed_interrupt(RunRegistry::default());
 
         assert!(
             !reverted_ok,
             "a failed revert save must be reported as failed"
         );
         assert_eq!(
-            app.run_registry, before,
+            app.run_service.run_registry, before,
             "the in-memory registry must not silently adopt an unpersisted revert"
         );
         assert!(
-            app.run_registry_load_error.is_some(),
+            app.run_service.run_registry_load_error.is_some(),
             "a failed compensating persist must disable durable run operations, not just log"
         );
 
@@ -2064,7 +1819,7 @@ mod tests {
         fixture.seed_run("close-persistence-failure", RunState::Running);
         let blocked_parent = temp.directory.join("not-a-directory");
         std::fs::write(&blocked_parent, b"block registry parent").expect("block registry path");
-        fixture.app.run_registry_path = Some(blocked_parent.join("runs.json"));
+        fixture.app.run_service.run_registry_path = Some(blocked_parent.join("runs.json"));
 
         let closed = fixture.request(
             "close",
@@ -2266,7 +2021,7 @@ mod tests {
                     sequence: 1,
                 },
                 RunOperation::Submit,
-                crate::app::App::run_now_unix(),
+                RunService::run_now_unix(),
             ),
             Err(RunError::ReplayRejected)
         );
@@ -2293,7 +2048,7 @@ mod tests {
                     sequence: 1,
                 },
                 RunOperation::Cancel,
-                crate::app::App::run_now_unix(),
+                RunService::run_now_unix(),
             ),
             Err(RunError::ReplayRejected)
         );

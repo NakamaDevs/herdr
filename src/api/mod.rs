@@ -96,3 +96,4 @@ pub type ApiRequestSender = mpsc::UnboundedSender<ApiRequestMessage>;
 pub fn socket_path() -> PathBuf {
     crate::session::active_api_socket_path()
 }
+pub(crate) mod responses;

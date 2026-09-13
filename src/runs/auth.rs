@@ -35,6 +35,12 @@ pub struct Capability {
     pub operations: Vec<RunOperation>,
     pub issued_at_unix: u64,
     pub expires_at_unix: u64,
+    /// Exact issuance time. Older records use the whole-second timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issued_at_unix_ms: Option<u64>,
+    /// Exact expiry time. Older records use the whole-second timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix_ms: Option<u64>,
     /// Highest sequence already consumed. A reference must exceed it.
     #[serde(default)]
     pub last_sequence: u64,
@@ -42,13 +48,33 @@ pub struct Capability {
 
 impl Capability {
     /// True when `now_unix` is at or past the absolute expiry.
+    #[cfg(test)]
     pub fn is_expired(&self, now_unix: u64) -> bool {
-        now_unix >= self.expires_at_unix
+        self.is_expired_at_millis(now_unix.saturating_mul(1000))
+    }
+
+    pub fn is_expired_at_millis(&self, now_unix_ms: u64) -> bool {
+        now_unix_ms
+            >= self
+                .expires_at_unix_ms
+                .unwrap_or_else(|| self.expires_at_unix.saturating_mul(1000))
     }
 
     /// True when this capability authorizes `operation`.
     pub fn allows(&self, operation: RunOperation) -> bool {
         self.operations.contains(&operation)
+    }
+
+    pub(super) fn valid_timestamps(&self) -> bool {
+        match (self.issued_at_unix_ms, self.expires_at_unix_ms) {
+            (Some(issued), Some(expires)) => {
+                issued <= expires
+                    && issued / 1000 == self.issued_at_unix
+                    && expires.div_ceil(1000) == self.expires_at_unix
+            }
+            (None, None) => self.issued_at_unix <= self.expires_at_unix,
+            _ => false,
+        }
     }
 }
 
