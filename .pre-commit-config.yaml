@@ -1,0 +1,10 @@
+default_install_hook_types: [pre-commit, commit-msg]
+repos:
+
+  - repo: local
+    hooks:
+      - id: kaicho-delivery-reference
+        name: Kaicho v2.1 semantic commit and Linear reference
+        entry: python3 .nakama/kaicho_delivery.py commit
+        language: system
+        stages: [commit-msg]

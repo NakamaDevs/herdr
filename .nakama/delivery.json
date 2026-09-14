@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "governance_version": "2.1.0",
+  "repository": "NakamaDevs/herdr",
+  "default_branch": "master",
+  "mode": "solo",
+  "source_commit": "91ec23b858c2d6aa74a987901592c7493259e89d",
+  "source": "NakamaDevs/Kaicho",
+  "owner_override": "hectorddmx",
+  "rollout_issue": "NAK-946",
+  "existing_branches": [
+    "feat/cx/NAK-439-durable-run-api",
+    "feat/cx/NAK-440-guarded-prompt-staging",
+    "fix/cx/NAK-441-macos-live-handoff-fixture",
+    "master"
+  ],
+  "mirrors": {
+    "engineering-v2.md": "4e72c09da174d01e6ab5e51cbc3e2a8a78c13edcf224705fbed8ffcf2700c168",
+    "organization.md": "a726e706d0148288051f64cc992569f08d65227b198c34d4704efd8602a38f49",
+    "delivery-profiles.md": "2f8a48d7bdd078523e6ef653b17d8cf93b7e5656bdc47b2510f59d112363d19b"
+  },
+  "delivery_check_sha256": "a8b257e72bc8e92d72a85307a345662519f4a569d6e4e3f951b9d82251f392b9"
+}
