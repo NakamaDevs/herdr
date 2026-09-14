@@ -559,6 +559,9 @@ impl RunService {
             return Self::run_error(id, RunError::PersistenceUnavailable);
         };
         if let Err(error) = self.persist_run_registry(running) {
+            // Text reached the transport, but no Enter can safely follow this failed save.
+            // Keep the binding reserved and reject retries until the operator investigates.
+            self.run_registry_load_error = Some("durable run registry is unavailable".to_string());
             return Self::run_error(id, error);
         }
         let Some(runtime) = host.lookup_runtime_sender(target.workspace_index, target.pane_id)

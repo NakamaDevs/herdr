@@ -3173,7 +3173,16 @@ impl PaneRuntime {
 
     /// Number of delayed inputs whose awaited delivery is still outstanding.
     pub fn pending_delayed_input_count(&self) -> usize {
-        self.pending_delayed_input.load(Ordering::Acquire)
+        let pending_runs = lock_pending_run_inputs(&self.pending_run_inputs)
+            .values()
+            .filter(|input| {
+                matches!(
+                    *input.lock_phase(),
+                    RunInputPhase::Pending | RunInputPhase::Delivering
+                )
+            })
+            .count();
+        self.pending_delayed_input.load(Ordering::Acquire) + pending_runs
     }
 
     pub fn schedule_run_bytes_after(

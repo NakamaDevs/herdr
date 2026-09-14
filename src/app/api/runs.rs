@@ -112,6 +112,12 @@ impl RunHost for crate::app::App {
     }
 
     fn target_ready_for_submit(&self, target: &LiveRunTarget) -> bool {
+        if self
+            .lookup_runtime_sender(target.workspace_index, target.pane_id)
+            .is_none_or(|runtime| runtime.pending_delayed_input_count() != 0)
+        {
+            return false;
+        }
         let workspace = &self.state.workspaces[target.workspace_index];
         workspace
             .terminal_id(target.pane_id)
@@ -487,6 +493,29 @@ mod tests {
                 .is_err());
             assert!(fixture.app.run_service.run_registry.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn submit_rejects_an_idle_agent_with_an_earlier_pending_enter() {
+        let temp = TempRegistry::new("submit-pending-enter");
+        let mut fixture = live_run_fixture(&temp);
+        let pane = fixture.app.state.workspaces[0].tabs[0].root_pane;
+        fixture
+            .app
+            .lookup_runtime_sender(0, pane)
+            .unwrap()
+            .send_bytes_after(
+                Bytes::from_static(b"\r"),
+                std::time::Duration::from_secs(60),
+            );
+        let capability = fixture.issue_capability(vec![RunOperation::Submit]);
+        let submitted = fixture.request(
+            "pending-enter",
+            Method::RunSubmit(fixture.submit_params(capability, "pending-enter", "review")),
+        );
+        assert_eq!(submitted["error"]["code"], "run_target_unavailable");
+        assert!(fixture.prompt_rx.as_mut().unwrap().try_recv().is_err());
+        assert!(fixture.app.run_service.run_registry.is_empty());
     }
 
     #[tokio::test]
@@ -1375,6 +1404,45 @@ mod tests {
             .expect("fake runtime receiver")
             .try_recv()
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn running_save_failure_after_prompt_delivery_disables_run_retries() {
+        let temp = TempRegistry::new("running-save-failure");
+        let blocked_temporary = temp.path.with_extension("json.tmp");
+        let observer_temporary = blocked_temporary.clone();
+        let mut fixture = live_run_fixture_with_input_observer(&temp, move |_| {
+            std::fs::create_dir(&observer_temporary).expect("block the next registry save");
+        });
+        let capability = fixture.issue_capability(vec![RunOperation::Submit]);
+        let submitted = fixture.request(
+            "submit",
+            Method::RunSubmit(fixture.submit_params(capability.clone(), "save-failure", "review")),
+        );
+        assert_eq!(submitted["error"]["code"], "run_persistence_unavailable");
+        assert_eq!(
+            fixture.prompt_rx.as_mut().unwrap().try_recv().unwrap(),
+            Bytes::from_static(b"\x1b[200~review\x1b[201~")
+        );
+        std::fs::remove_dir(&blocked_temporary).expect("restore persistence");
+        let retry = fixture.request(
+            "retry",
+            Method::RunSubmit(fixture.submit_params(
+                RunCapabilityRef {
+                    sequence: 2,
+                    ..capability
+                },
+                "save-failure",
+                "review",
+            )),
+        );
+        assert_eq!(retry["error"]["code"], "run_persistence_unavailable");
+        assert!(fixture.app.run_service.run_registry_load_error.is_some());
+        assert!(fixture.prompt_rx.as_mut().unwrap().try_recv().is_err());
+        assert_eq!(
+            fixture.app.run_service.run_registry.records()[0].state,
+            RunState::Queued
+        );
     }
 
     #[tokio::test]

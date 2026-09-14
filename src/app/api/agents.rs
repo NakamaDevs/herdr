@@ -572,6 +572,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_prompt_submit_false_rejects_pending_durable_run_enter() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .unwrap()
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        let (runtime, mut rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80, 24, 0, b"", 4,
+            );
+        runtime.schedule_run_bytes_after(
+            "durable-run".into(),
+            Bytes::from_static(b"\r"),
+            Duration::from_secs(60),
+        );
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        let response = app.handle_agent_prompt(
+            "req-stage".into(),
+            AgentPromptParams {
+                target: "reviewer".into(),
+                text: "must remain staged".into(),
+                wait: None,
+                submit: Some(false),
+            },
+        );
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "agent_prompt_submit_pending");
+        assert!(rx.try_recv().is_err(), "rejected staging sent input");
+        let runtime = app.lookup_runtime_sender(0, pane_id).unwrap();
+        assert_eq!(runtime.pending_delayed_input_count(), 1);
+        assert_eq!(
+            runtime.cancel_scheduled_run_input("durable-run"),
+            Some(Bytes::from_static(b"\r"))
+        );
+        assert_eq!(runtime.pending_delayed_input_count(), 0);
+    }
+
+    #[tokio::test]
     async fn agent_prompt_submit_false_succeeds_on_other_pane_while_enter_pending() {
         let mut app = app_with_agent();
         app.state.workspaces.push(Workspace::test_new("other"));
