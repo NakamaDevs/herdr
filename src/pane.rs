@@ -1,9 +1,10 @@
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering},
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
 };
 
 use bytes::Bytes;
@@ -1050,10 +1051,267 @@ pub struct PaneRuntime {
     /// Delayed inputs scheduled on this pane whose awaited delivery has not
     /// completed or failed yet.
     pending_delayed_input: Arc<AtomicUsize>,
+    pending_run_inputs: Arc<Mutex<HashMap<String, Arc<PendingRunInput>>>>,
     preserve_processes_on_drop: bool,
     // Task handles for deterministic shutdown
     detect_handle: Option<tokio::task::AbortHandle>,
 }
+
+/// Lifecycle of one scheduled run input (a delayed keystroke, e.g. the Enter
+/// that submits a durable run's prompt after the agent has had time to accept
+/// pasted text).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunInputPhase {
+    /// Not yet claimed by delivery or cancellation.
+    Pending,
+    /// Cancelled before delivery claimed it; it will never be written.
+    Cancelled,
+    /// Delivery claimed it and is writing it now.
+    Delivering,
+    /// Delivery finished writing it, successfully.
+    Delivered,
+    /// Delivery claimed it but the write could not be enqueued at all (e.g.
+    /// a full or closed transport during a handoff flush). Distinct from
+    /// `Delivered` so a lost write is never mistaken for a sent one. Only
+    /// constructed by the unix-only handoff flush path.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Undelivered,
+}
+
+/// Serializes one scheduled run input's delayed delivery against a caller
+/// that wants to cancel it, so a subsequent write from that caller (e.g. an
+/// interrupt) can never race ahead of, or follow, an in-flight delivery.
+struct PendingRunInput {
+    // Retained for cancellation recovery and handoff delivery.
+    bytes: Bytes,
+    phase: Mutex<RunInputPhase>,
+    resolved: Condvar,
+}
+
+impl PendingRunInput {
+    fn new(bytes: Bytes) -> Arc<Self> {
+        Arc::new(Self {
+            bytes,
+            phase: Mutex::new(RunInputPhase::Pending),
+            resolved: Condvar::new(),
+        })
+    }
+
+    fn lock_phase(&self) -> std::sync::MutexGuard<'_, RunInputPhase> {
+        match self.phase.lock() {
+            Ok(phase) => phase,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Claim delivery. Returns true at most once, and only if cancellation
+    /// did not already win the race.
+    fn begin_delivery(&self) -> bool {
+        let mut phase = self.lock_phase();
+        if *phase == RunInputPhase::Pending {
+            *phase = RunInputPhase::Delivering;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Mark delivery finished (written, or failed after the normal delayed
+    /// path already committed to a single attempt) and wake any waiter.
+    fn finish_delivery(&self) {
+        let mut phase = self.lock_phase();
+        *phase = RunInputPhase::Delivered;
+        drop(phase);
+        self.resolved.notify_all();
+    }
+
+    /// Mark delivery as claimed but never actually sent (the write could not
+    /// be enqueued at all), and wake any waiter. Kept distinct from
+    /// `finish_delivery` so a caller can never observe a lost write as a
+    /// delivered one.
+    #[cfg(unix)]
+    fn fail_delivery(&self) {
+        let mut phase = self.lock_phase();
+        *phase = RunInputPhase::Undelivered;
+        drop(phase);
+        self.resolved.notify_all();
+    }
+
+    /// Cancel without waiting for an in-flight delivery to resolve. Used for
+    /// a real teardown where nothing observes the outcome, so there is
+    /// nothing to gain from blocking on a delivery that may itself be
+    /// waiting on queue capacity that teardown will never free.
+    fn cancel_without_waiting(&self) {
+        let mut phase = self.lock_phase();
+        if *phase == RunInputPhase::Pending {
+            *phase = RunInputPhase::Cancelled;
+        }
+    }
+
+    /// Cancel this input. If delivery already claimed it, block until that
+    /// delivery fully resolves before returning, so the caller's next write
+    /// (e.g. an interrupt) is guaranteed to observe the delayed input as
+    /// either fully suppressed or already sent, never still in flight.
+    /// Returns true when the input did not reach the transport.
+    fn cancel_and_await_resolution(&self) -> bool {
+        let mut phase = self.lock_phase();
+        loop {
+            match *phase {
+                RunInputPhase::Pending => {
+                    *phase = RunInputPhase::Cancelled;
+                    return true;
+                }
+                RunInputPhase::Cancelled | RunInputPhase::Undelivered => return true,
+                RunInputPhase::Delivered => return false,
+                RunInputPhase::Delivering => {
+                    phase = match self.resolved.wait(phase) {
+                        Ok(phase) => phase,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                }
+            }
+        }
+    }
+
+    /// Best-effort synchronous flush used only at a handoff boundary, where
+    /// the transport is about to stop accepting writes for good and waiting
+    /// out the original delay is not an option.
+    ///
+    /// If this input is still pending, claim and write it immediately
+    /// through `io` right now, while it is still guaranteed to accept
+    /// writes. If delivery already claimed it, wait for that delivery to
+    /// resolve instead of racing ahead of it or re-sending it; the wait
+    /// still happens before the caller disables further writes, so an
+    /// already in-flight write can still land.
+    ///
+    /// A momentarily full command queue is retried (bounded): the actor
+    /// drains it continuously on its own dedicated thread, so a transient
+    /// full queue right at the handoff boundary is expected to clear within
+    /// milliseconds, and retrying here is the only chance this input gets
+    /// before the transport goes away for good. A closed transport (the
+    /// actor itself is gone) is not retried -- there is nothing left to
+    /// retry against.
+    #[cfg(unix)]
+    fn flush_before_handoff(&self, io: &PaneRuntimeIo) {
+        let mut phase = self.lock_phase();
+        loop {
+            match *phase {
+                RunInputPhase::Pending => {
+                    *phase = RunInputPhase::Delivering;
+                    drop(phase);
+                    match try_send_bytes_with_bounded_retry(io, self.bytes.clone()) {
+                        Ok(()) => self.finish_delivery(),
+                        Err(err) => {
+                            error!(
+                                error = ?err,
+                                "lost delayed run input: could not flush it before handoff"
+                            );
+                            self.fail_delivery();
+                        }
+                    }
+                    return;
+                }
+                RunInputPhase::Cancelled
+                | RunInputPhase::Delivered
+                | RunInputPhase::Undelivered => return,
+                RunInputPhase::Delivering => {
+                    phase = match self.resolved.wait(phase) {
+                        Ok(phase) => phase,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                }
+            }
+        }
+    }
+}
+
+/// Bounded attempt count for [`try_send_bytes_with_bounded_retry`]. The
+/// actor drains its command queue continuously on its own thread, so a
+/// queue that is transiently full at the handoff boundary is expected to
+/// have room again well within this budget.
+#[cfg(unix)]
+const HANDOFF_FLUSH_RETRY_ATTEMPTS: u32 = 40;
+/// Delay between attempts in [`try_send_bytes_with_bounded_retry`].
+#[cfg(unix)]
+const HANDOFF_FLUSH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
+
+// Test-only hook fired the instant a retry attempt in
+// try_send_bytes_with_bounded_retry observes TrySendError::Full, so a test
+// can prove the retry loop genuinely started (rather than assuming a fixed
+// delay was long enough) before acting on that knowledge. A plain
+// thread-local is sound here even under a multi-threaded test runtime:
+// nothing between a test registering the hook and the retry loop's first
+// Full observation crosses an .await point, so that whole chain always runs
+// on the one OS thread that registered it.
+#[cfg(all(test, unix))]
+thread_local! {
+    static TEST_ON_FULL_RETRY: std::cell::RefCell<Option<Arc<dyn Fn() + Send + Sync>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+fn test_set_on_full_retry_hook(hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+    TEST_ON_FULL_RETRY.with(|cell| *cell.borrow_mut() = hook);
+}
+
+/// Retry `io.try_send_bytes(bytes)` while the transport merely reports a
+/// full queue, up to a bounded attempt count. A closed transport is
+/// returned immediately: the actor itself is gone, so nothing is left to
+/// retry against.
+#[cfg(unix)]
+fn try_send_bytes_with_bounded_retry(
+    io: &PaneRuntimeIo,
+    bytes: Bytes,
+) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+    let mut bytes = bytes;
+    let mut attempts_remaining = HANDOFF_FLUSH_RETRY_ATTEMPTS;
+    loop {
+        match io.try_send_bytes(bytes) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::error::TrySendError::Full(returned)) => {
+                #[cfg(test)]
+                TEST_ON_FULL_RETRY.with(|cell| {
+                    if let Some(hook) = cell.borrow().as_ref() {
+                        hook();
+                    }
+                });
+                attempts_remaining -= 1;
+                if attempts_remaining == 0 {
+                    return Err(mpsc::error::TrySendError::Full(returned));
+                }
+                bytes = returned;
+                std::thread::sleep(HANDOFF_FLUSH_RETRY_DELAY);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn lock_pending_run_inputs(
+    pending_run_inputs: &Mutex<HashMap<String, Arc<PendingRunInput>>>,
+) -> std::sync::MutexGuard<'_, HashMap<String, Arc<PendingRunInput>>> {
+    match pending_run_inputs.lock() {
+        Ok(pending_run_inputs) => pending_run_inputs,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn retire_pending_run_input(
+    pending_run_inputs: &Mutex<HashMap<String, Arc<PendingRunInput>>>,
+    run_id: &str,
+    handle: &Arc<PendingRunInput>,
+) {
+    let mut pending_run_inputs = lock_pending_run_inputs(pending_run_inputs);
+    if pending_run_inputs
+        .get(run_id)
+        .is_some_and(|current| Arc::ptr_eq(current, handle))
+    {
+        pending_run_inputs.remove(run_id);
+    }
+}
+
+#[cfg(test)]
+type TestInputObserver = Arc<dyn Fn(&Bytes) + Send + Sync>;
 
 enum PaneRuntimeIo {
     Actor(PtyIoActorHandle),
@@ -1061,6 +1319,7 @@ enum PaneRuntimeIo {
     TestChannel {
         sender: mpsc::Sender<Bytes>,
         resize_tx: watch::Sender<(u16, u16, u32, u32)>,
+        input_observer: Option<TestInputObserver>,
     },
 }
 
@@ -1180,7 +1439,20 @@ impl PaneRuntimeIo {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.try_write_user_input(bytes),
             #[cfg(test)]
-            PaneRuntimeIo::TestChannel { sender, .. } => sender.try_send(bytes),
+            PaneRuntimeIo::TestChannel {
+                sender,
+                input_observer,
+                ..
+            } => {
+                let observed = bytes.clone();
+                let result = sender.try_send(bytes);
+                if result.is_ok() {
+                    if let Some(observer) = input_observer {
+                        observer(&observed);
+                    }
+                }
+                result
+            }
         }
     }
 
@@ -1218,11 +1490,13 @@ impl PaneRuntimeIo {
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { sender, .. } => {
                 let sender = sender.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(delay).await;
-                    let _ = sender.send(bytes).await;
-                    drop(pending);
-                });
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    std::mem::drop(runtime.spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let _ = sender.send(bytes).await;
+                        drop(pending);
+                    }));
+                }
             }
         }
     }
@@ -1259,6 +1533,7 @@ impl Drop for PaneRuntime {
         if let Some(handle) = &self.detect_handle {
             handle.abort();
         }
+        self.cancel_all_scheduled_run_inputs();
         self.io.shutdown();
         if !self.preserve_processes_on_drop {
             shutdown_pane_processes(
@@ -1625,6 +1900,7 @@ impl PaneRuntime {
         if let Some(handle) = self.detect_handle.take() {
             handle.abort();
         }
+        self.cancel_all_scheduled_run_inputs();
         self.io.shutdown();
         shutdown_pane_processes(
             self.pane_id,
@@ -1641,6 +1917,12 @@ impl PaneRuntime {
 
     #[cfg(unix)]
     pub fn preserve_for_handoff(mut self) {
+        // Flush any still-scheduled run input (e.g. a persisted durable
+        // run's delayed Enter) before releasing the transport below: once
+        // released, the actor refuses every further write for good, so an
+        // already spawned delivery task waiting out its remaining delay
+        // would silently fail instead of ever landing.
+        self.flush_scheduled_run_inputs_before_handoff();
         if let Err(err) = self.io.release_after_commit() {
             warn!(
                 pane = self.pane_id.raw(),
@@ -1673,6 +1955,13 @@ impl PaneRuntime {
 
     #[cfg(unix)]
     pub fn pause_handoff_reader(&self, timeout: std::time::Duration) -> std::io::Result<()> {
+        // Flush any still-scheduled run input (e.g. a persisted durable
+        // run's delayed Enter) into the actor's write queue before it
+        // quiesces below: once quiesced, the actor silently refuses to
+        // enqueue any further `WriteUserInput` command, and once fully
+        // released it also discards whatever is still queued, so a flush
+        // attempted any later than this would be too late either way.
+        self.flush_scheduled_run_inputs_before_handoff();
         self.io.begin_handoff(timeout)
     }
 
@@ -2038,6 +2327,7 @@ impl PaneRuntime {
             detect_reset_notify,
             pending_release,
             pending_delayed_input: Arc::new(AtomicUsize::new(0)),
+            pending_run_inputs: Arc::new(Mutex::new(HashMap::new())),
             preserve_processes_on_drop: true,
             detect_handle: Some(detect_handle),
         })
@@ -2590,6 +2880,7 @@ impl PaneRuntime {
             detect_reset_notify,
             pending_release,
             pending_delayed_input: Arc::new(AtomicUsize::new(0)),
+            pending_run_inputs: Arc::new(Mutex::new(HashMap::new())),
             preserve_processes_on_drop: false,
             detect_handle,
         })
@@ -2882,7 +3173,118 @@ impl PaneRuntime {
 
     /// Number of delayed inputs whose awaited delivery is still outstanding.
     pub fn pending_delayed_input_count(&self) -> usize {
-        self.pending_delayed_input.load(Ordering::Acquire)
+        let pending_runs = lock_pending_run_inputs(&self.pending_run_inputs)
+            .values()
+            .filter(|input| {
+                matches!(
+                    *input.lock_phase(),
+                    RunInputPhase::Pending | RunInputPhase::Delivering
+                )
+            })
+            .count();
+        self.pending_delayed_input.load(Ordering::Acquire) + pending_runs
+    }
+
+    pub fn schedule_run_bytes_after(
+        &self,
+        run_id: String,
+        bytes: Bytes,
+        delay: std::time::Duration,
+    ) {
+        let handle = PendingRunInput::new(bytes.clone());
+        let previous = lock_pending_run_inputs(&self.pending_run_inputs)
+            .insert(run_id.clone(), handle.clone());
+        if let Some(previous) = previous {
+            previous.cancel_and_await_resolution();
+        }
+        let pending_run_inputs = Arc::clone(&self.pending_run_inputs);
+        match &self.io {
+            PaneRuntimeIo::Actor(actor) => {
+                let actor = actor.clone();
+                let delivery = handle.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    if delivery.begin_delivery() {
+                        if let Err(err) = actor.write_user_input(bytes).await {
+                            warn!(error = %err, "failed to send delayed run input");
+                        }
+                        delivery.finish_delivery();
+                    }
+                    retire_pending_run_input(&pending_run_inputs, &run_id, &delivery);
+                });
+            }
+            #[cfg(test)]
+            PaneRuntimeIo::TestChannel {
+                sender,
+                input_observer,
+                ..
+            } => {
+                let sender = sender.clone();
+                let delivery = handle.clone();
+                let observer = input_observer.clone();
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    std::mem::drop(runtime.spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        if delivery.begin_delivery() {
+                            // Fired the instant delivery is claimed, before
+                            // the (possibly capacity-blocked) send below, so
+                            // tests can deterministically wait for delivery
+                            // to actually be in flight instead of guessing
+                            // with a fixed sleep.
+                            if let Some(observer) = &observer {
+                                observer(&bytes);
+                            }
+                            let _ = sender.send(bytes).await;
+                            delivery.finish_delivery();
+                        }
+                        retire_pending_run_input(&pending_run_inputs, &run_id, &delivery);
+                    }));
+                } else {
+                    delivery.cancel_and_await_resolution();
+                    retire_pending_run_input(&pending_run_inputs, &run_id, &delivery);
+                }
+            }
+        }
+    }
+
+    /// Cancel a scheduled run input. If its delivery already started, this
+    /// blocks until that delivery is fully resolved before returning, so a
+    /// caller that writes an interrupt right after this call can never race
+    /// ahead of the delayed input landing on the pane.
+    /// Returns the exact bytes when the tracked input did not reach the transport.
+    pub fn cancel_scheduled_run_input(&self, run_id: &str) -> Option<Bytes> {
+        let handle = lock_pending_run_inputs(&self.pending_run_inputs).remove(run_id);
+        handle.and_then(|handle| {
+            handle
+                .cancel_and_await_resolution()
+                .then(|| handle.bytes.clone())
+        })
+    }
+
+    fn cancel_all_scheduled_run_inputs(&self) {
+        let mut pending_run_inputs = lock_pending_run_inputs(&self.pending_run_inputs);
+        for handle in pending_run_inputs.values() {
+            handle.cancel_without_waiting();
+        }
+        pending_run_inputs.clear();
+    }
+
+    /// Flush every scheduled run input immediately, synchronously, before a
+    /// handoff disables further writes on this runtime's transport for good.
+    /// Waiting out the original delay is not an option at a handoff boundary
+    /// (the transport will refuse writes once released), so this claims and
+    /// writes anything still pending right now instead.
+    #[cfg(unix)]
+    fn flush_scheduled_run_inputs_before_handoff(&self) {
+        let handles: Vec<_> = {
+            let mut pending_run_inputs = lock_pending_run_inputs(&self.pending_run_inputs);
+            let handles = pending_run_inputs.values().cloned().collect();
+            pending_run_inputs.clear();
+            handles
+        };
+        for handle in handles {
+            handle.flush_before_handoff(&self.io);
+        }
     }
 
     pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {
@@ -3066,6 +3468,24 @@ impl PaneRuntime {
         Self::test_with_channel_and_scrollback_bytes(cols, rows, 0, &[], capacity)
     }
 
+    pub(crate) fn test_with_channel_and_input_observer<F>(
+        cols: u16,
+        rows: u16,
+        input_observer: F,
+    ) -> (Self, mpsc::Receiver<Bytes>)
+    where
+        F: Fn(&Bytes) + Send + Sync + 'static,
+    {
+        Self::test_with_channel_and_scrollback_bytes_with_observer(
+            cols,
+            rows,
+            0,
+            &[],
+            4,
+            Some(Arc::new(input_observer)),
+        )
+    }
+
     pub(crate) fn test_with_screen_bytes(cols: u16, rows: u16, bytes: &[u8]) -> Self {
         Self::test_with_scrollback_bytes(cols, rows, 0, bytes)
     }
@@ -3093,6 +3513,24 @@ impl PaneRuntime {
         bytes: &[u8],
         channel_capacity: usize,
     ) -> (Self, mpsc::Receiver<Bytes>) {
+        Self::test_with_channel_and_scrollback_bytes_with_observer(
+            cols,
+            rows,
+            scrollback_limit_bytes,
+            bytes,
+            channel_capacity,
+            None,
+        )
+    }
+
+    fn test_with_channel_and_scrollback_bytes_with_observer(
+        cols: u16,
+        rows: u16,
+        scrollback_limit_bytes: usize,
+        bytes: &[u8],
+        channel_capacity: usize,
+        input_observer: Option<TestInputObserver>,
+    ) -> (Self, mpsc::Receiver<Bytes>) {
         let (tx, rx) = mpsc::channel(channel_capacity);
         let (resize_tx, _resize_rx) = watch::channel((rows, cols, 0, 0));
         let mut terminal =
@@ -3108,6 +3546,7 @@ impl PaneRuntime {
                 io: PaneRuntimeIo::TestChannel {
                     sender: tx,
                     resize_tx,
+                    input_observer,
                 },
                 current_size: Cell::new((rows, cols, 0, 0)),
                 child_pid: Arc::new(AtomicU32::new(0)),
@@ -3120,6 +3559,7 @@ impl PaneRuntime {
                 detect_reset_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
                 pending_delayed_input: Arc::new(AtomicUsize::new(0)),
+                pending_run_inputs: Arc::new(Mutex::new(HashMap::new())),
                 preserve_processes_on_drop: true,
                 detect_handle: Some(tokio::spawn(async {}).abort_handle()),
             },
@@ -3186,6 +3626,378 @@ mod tests {
         );
         tokio::time::sleep(SETTLE).await;
         assert_eq!(runtime.pending_delayed_input_count(), 0);
+    }
+
+    const RUN_ENTER: &[u8] = b"\r";
+
+    // NAK-439 durable-run race coverage.
+
+    /// Defect: `preserve_for_handoff` used to cancel every scheduled run
+    /// input synchronously, so a persisted `Running` run's delayed Enter was
+    /// discarded the instant a pane handed off, leaving that run bound to its
+    /// pane forever with no way to reach an observed outcome.
+    ///
+    /// The delay here is deliberately long: the fix must flush the run input
+    /// immediately at the handoff boundary, not merely leave the original
+    /// timer to fire on its own later, so a short receive timeout still has
+    /// to see it land.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scheduled_run_input_survives_handoff_and_is_still_delivered() {
+        let (runtime, mut rx) = PaneRuntime::test_with_channel(80, 24);
+        runtime.schedule_run_bytes_after(
+            "run_handoff".to_string(),
+            Bytes::from_static(RUN_ENTER),
+            std::time::Duration::from_secs(10),
+        );
+
+        runtime.preserve_for_handoff();
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv())
+                .await
+                .expect("handoff must flush the delayed run input immediately, not wait it out")
+                .expect("channel open"),
+            Bytes::from_static(RUN_ENTER)
+        );
+    }
+
+    /// Same defect as above, but through the real PTY actor instead of the
+    /// test channel: `TestChannel`'s `release_after_commit` is a no-op, so it
+    /// never exercised `release_after_commit` actually disabling further
+    /// writes on the real actor once called. A fix that only reorders a flag
+    /// without flushing before that call would pass the `TestChannel`
+    /// version of this test above and still lose the Enter here.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scheduled_run_input_survives_handoff_through_the_real_pty_actor() {
+        let (events, _event_rx) = mpsc::channel(8);
+        let pane_id = PaneId::from_raw(4390);
+        let output_path = std::env::temp_dir().join(format!(
+            "herdr-pane-run-input-handoff-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let started_path = format!("{}.started", output_path.display());
+        let runtime = PaneRuntime::spawn_shell_command(
+            pane_id,
+            24,
+            80,
+            std::env::temp_dir(),
+            // `touch` gives an observable, pollable signal that the shell
+            // itself is running (proving the child spawned at all) without
+            // needing a race-prone fixed sleep. `exec` for the final `dd`
+            // then replaces that same shell process directly (no second
+            // fork), so there is exactly one fork total between spawn and
+            // `dd` actually reading.
+            &format!(
+                "touch '{started_path}'; exec dd bs=1 count=1 of='{}'",
+                output_path.display()
+            ),
+            &PaneLaunchEnv::default(),
+            AgentDetection::Disabled,
+            0,
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        )
+        .expect("spawn real PTY-backed pane");
+
+        // Wait for real, observable proof that the child is actually
+        // running (not a guess based on elapsed wall-clock time) before
+        // scheduling anything: forking and exec'ing the child is not
+        // instantaneous, and scheduling or handing off before it completes
+        // is a race unrelated to what this test is proving.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while std::fs::metadata(&started_path).is_err() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("child process must start");
+
+        runtime.schedule_run_bytes_after(
+            "run_handoff_real_actor".to_string(),
+            Bytes::from_static(RUN_ENTER),
+            std::time::Duration::from_secs(10),
+        );
+
+        // Matches the real production handoff sequence (see
+        // server/headless.rs): the actor is quiesced via
+        // `pause_handoff_reader`, a duplicate master fd is taken for the new
+        // owner, and only then is the original released via
+        // `preserve_for_handoff`. Skipping the duplicate here (unlike
+        // production) would let the master side fully close with nothing
+        // else holding it open, racing the real child process's own
+        // scheduling to read the buffered byte before the kernel tears the
+        // PTY down -- an artifact of this test's setup, not of the fix.
+        runtime
+            .pause_handoff_reader(std::time::Duration::from_secs(10))
+            .expect("pause handoff reader");
+        let _duplicated_master = unsafe {
+            use std::os::fd::FromRawFd;
+            std::os::fd::OwnedFd::from_raw_fd(
+                runtime
+                    .duplicate_handoff_fd()
+                    .expect("duplicate handoff fd"),
+            )
+        };
+        runtime.preserve_for_handoff();
+
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Ok(contents) = std::fs::read(&output_path) {
+                    if !contents.is_empty() {
+                        return contents;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect(
+            "handoff must flush the delayed run input through the real PTY actor before releasing it",
+        );
+        let _ = std::fs::remove_file(&output_path);
+        let _ = std::fs::remove_file(&started_path);
+
+        assert_eq!(
+            delivered.len(),
+            1,
+            "the real child process must receive exactly the flushed byte"
+        );
+    }
+
+    /// A real close (not a handoff) must still discard scheduled run input
+    /// instead of writing it into a pane nobody is going to read again.
+    #[tokio::test]
+    async fn scheduled_run_input_is_dropped_on_real_shutdown() {
+        let (runtime, mut rx) = PaneRuntime::test_with_channel(80, 24);
+        runtime.schedule_run_bytes_after(
+            "run_shutdown".to_string(),
+            Bytes::from_static(RUN_ENTER),
+            std::time::Duration::from_millis(30),
+        );
+
+        runtime.shutdown();
+
+        // Either the channel times out or closes with nothing queued; either
+        // way, the scheduled Enter itself must never actually arrive.
+        if let Ok(Some(bytes)) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await
+        {
+            panic!("a real shutdown must not deliver the scheduled run input, got {bytes:?}");
+        }
+    }
+
+    /// Defect: cancellation and delayed delivery raced as an unsynchronized
+    /// check-then-write, so an interrupt sent right after cancelling could
+    /// land on the pane before a delayed Enter that had already started
+    /// writing, or the Enter could still land after the interrupt. Cancel
+    /// must fully resolve (suppressed, or already delivered) before it
+    /// returns.
+    #[test]
+    fn cancel_before_delivery_claims_it_permanently_suppresses_delivery() {
+        let handle = PendingRunInput::new(Bytes::from_static(RUN_ENTER));
+
+        handle.cancel_and_await_resolution();
+
+        assert!(
+            !handle.begin_delivery(),
+            "a cancelled input must never begin delivery"
+        );
+    }
+
+    /// Defect: `flush_before_handoff` unconditionally called `finish_delivery`
+    /// (marking the input `Delivered`) even when `try_send_bytes` failed --
+    /// e.g. because the transport's queue was full or closed -- so a lost
+    /// write during handoff looked exactly like a successful one.
+    #[cfg(unix)]
+    #[test]
+    fn flush_before_handoff_does_not_mark_delivered_when_the_transport_rejects_the_write() {
+        let (sender, receiver) = mpsc::channel::<Bytes>(1);
+        drop(receiver); // closed transport: try_send_bytes must fail
+        let (resize_tx, _resize_rx) = watch::channel((24, 80, 0, 0));
+        let io = PaneRuntimeIo::TestChannel {
+            sender,
+            resize_tx,
+            input_observer: None,
+        };
+        let handle = PendingRunInput::new(Bytes::from_static(RUN_ENTER));
+
+        handle.flush_before_handoff(&io);
+
+        assert_eq!(
+            *handle.phase.lock().unwrap(),
+            RunInputPhase::Undelivered,
+            "a rejected write during handoff flush must not be recorded as delivered"
+        );
+    }
+
+    /// Defect: a scheduled run input whose flush hit a merely-full (not
+    /// closed) queue right at the handoff boundary was permanently lost --
+    /// the phase became honestly `Undelivered`, but nothing ever retried or
+    /// recovered the byte, so it still never reached the pane. This exercises
+    /// the real handoff entry point (`preserve_for_handoff`) end to end and
+    /// proves the byte is actually delivered once the queue has room again,
+    /// not merely that the phase bookkeeping is honest about the loss.
+    ///
+    /// A real synchronization point (`TEST_ON_FULL_RETRY`, mirroring the
+    /// `cancel_started` barrier used for the in-flight-cancellation test)
+    /// proves the retry loop actually observed a full queue on its first
+    /// attempt before the filler is drained -- not merely that a fixed
+    /// delay elapsed, which a late-scheduled `handoff_task` could satisfy
+    /// without ever exercising a retry at all.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flush_before_handoff_retries_through_a_transient_full_queue() {
+        let (runtime, mut rx) = PaneRuntime::test_with_channel_capacity(80, 24, 1);
+        // Fill the single slot so the flush below must retry.
+        runtime
+            .try_send_bytes(Bytes::from_static(b"filler"))
+            .unwrap();
+        runtime.schedule_run_bytes_after(
+            "run_full_queue".to_string(),
+            Bytes::from_static(RUN_ENTER),
+            std::time::Duration::from_secs(10),
+        );
+
+        let full_observed = Arc::new(tokio::sync::Notify::new());
+        let full_observed_signal = Arc::clone(&full_observed);
+
+        // `preserve_for_handoff` blocks synchronously (including the retry
+        // loop's backoff sleeps), so run it as its own task to let the
+        // draining below make progress concurrently on the other worker
+        // thread instead of starving it. The hook is registered from
+        // inside this same task: everything from here through the retry
+        // loop's first `Full` observation is one synchronous call chain
+        // with no `.await` in between, so it never migrates off whatever
+        // thread tokio schedules this task onto.
+        let handoff_task = tokio::spawn(async move {
+            test_set_on_full_retry_hook(Some(Arc::new(move || {
+                full_observed_signal.notify_one();
+            })));
+            runtime.preserve_for_handoff();
+            test_set_on_full_retry_hook(None);
+        });
+
+        // Real barrier: proves the retry loop has genuinely observed a full
+        // queue before the filler is drained, instead of assuming a fixed
+        // delay was long enough. Without this, a late-scheduled
+        // `handoff_task` could see the already-drained slot on its very
+        // first attempt -- exercising no retry at all -- and the test
+        // would still pass, proving nothing about the retry path.
+        tokio::time::timeout(std::time::Duration::from_secs(2), full_observed.notified())
+            .await
+            .expect("the retry loop must observe a full queue before the filler is drained");
+
+        assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(b"filler"));
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("the retried flush must actually deliver the byte")
+            .unwrap();
+        assert_eq!(delivered, Bytes::from_static(RUN_ENTER));
+
+        handoff_task.await.expect("handoff task must not panic");
+    }
+
+    /// Exercises the real `schedule_run_bytes_after` / `cancel_scheduled_run_input`
+    /// call path (not the internal `PendingRunInput` type) with a real
+    /// synchronization barrier instead of a fixed sleep: an observer fires
+    /// the instant delivery claims the input, so the test waits for genuine
+    /// proof that delivery is in flight before racing a cancel against it,
+    /// rather than assuming a sleep was long enough.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_scheduled_run_input_blocks_until_an_in_flight_delivery_resolves() {
+        let claimed = Arc::new(tokio::sync::Notify::new());
+        let claimed_for_observer = Arc::clone(&claimed);
+        let (runtime, mut rx) = PaneRuntime::test_with_channel_and_scrollback_bytes_with_observer(
+            80,
+            24,
+            0,
+            &[],
+            1,
+            Some(Arc::new(move |_bytes: &Bytes| {
+                claimed_for_observer.notify_one();
+            })),
+        );
+        // Fill the single channel slot so delivery has to block on send
+        // capacity once it claims the scheduled input below. `try_send_bytes`
+        // also fires the observer on success, so consume that stray
+        // notification before waiting for the one that actually matters:
+        // delivery claiming the scheduled input further down.
+        runtime
+            .try_send_bytes(Bytes::from_static(b"filler"))
+            .unwrap();
+        claimed.notified().await;
+
+        runtime.schedule_run_bytes_after(
+            "run_in_flight".to_string(),
+            Bytes::from_static(RUN_ENTER),
+            std::time::Duration::from_millis(0),
+        );
+
+        // Real barrier: proven proof that delivery has claimed this input,
+        // not a guess based on elapsed wall-clock time.
+        tokio::time::timeout(std::time::Duration::from_secs(2), claimed.notified())
+            .await
+            .expect("delivery must claim the scheduled input before cancel races it");
+
+        // Second synchronization point: proves the cancelling task has
+        // actually been scheduled and reached the call into
+        // `cancel_scheduled_run_input`, not merely that it was spawned.
+        // Without this, a broken, non-blocking `cancel_and_await_resolution`
+        // could still pass the `!is_finished()` check below simply because
+        // tokio hadn't gotten around to running the task at all yet -- proof
+        // that delivery claimed the input is not proof the canceller ever
+        // raced it. There is no `.await` between the signal and the call
+        // itself, so once this task is scheduled at all, both happen back to
+        // back within the same poll; combined with the channel staying full
+        // until drained below (so the phase this call observes cannot have
+        // moved past `Delivering`), reaching the call means it is
+        // deterministically about to enter the blocking wait.
+        let cancel_started = Arc::new(tokio::sync::Notify::new());
+        let cancel_started_signal = Arc::clone(&cancel_started);
+        // `PaneRuntime` is `Send` (moveable to another task) but not `Sync`
+        // (it is not meant to be shared across tasks concurrently), so hand
+        // it to the cancelling task by value instead of sharing a reference.
+        let cancel_task = tokio::spawn(async move {
+            cancel_started_signal.notify_one();
+            assert!(runtime
+                .cancel_scheduled_run_input("run_in_flight")
+                .is_none());
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), cancel_started.notified())
+            .await
+            .expect("the cancelling task must actually run");
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !cancel_task.is_finished(),
+            "cancel must block while delivery is in flight, not race ahead of it"
+        );
+
+        assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(b"filler"));
+        assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(RUN_ENTER));
+
+        cancel_task
+            .await
+            .expect("cancel task must resolve once delivery finishes");
+    }
+
+    #[test]
+    fn cancel_after_delivery_already_finished_is_a_no_op() {
+        let handle = PendingRunInput::new(Bytes::from_static(RUN_ENTER));
+        assert!(handle.begin_delivery());
+        handle.finish_delivery();
+
+        handle.cancel_and_await_resolution();
     }
 
     #[test]
@@ -3734,6 +4546,7 @@ mod tests {
             io: PaneRuntimeIo::TestChannel {
                 sender: tx,
                 resize_tx,
+                input_observer: None,
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
@@ -3746,6 +4559,7 @@ mod tests {
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             pending_delayed_input: Arc::new(AtomicUsize::new(0)),
+            pending_run_inputs: Arc::new(Mutex::new(HashMap::new())),
             preserve_processes_on_drop: true,
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
@@ -3767,6 +4581,7 @@ mod tests {
             io: PaneRuntimeIo::TestChannel {
                 sender: tx,
                 resize_tx,
+                input_observer: None,
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
@@ -3779,6 +4594,7 @@ mod tests {
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             pending_delayed_input: Arc::new(AtomicUsize::new(0)),
+            pending_run_inputs: Arc::new(Mutex::new(HashMap::new())),
             preserve_processes_on_drop: true,
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };

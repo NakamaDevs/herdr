@@ -70,6 +70,9 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::PaneReportMetadata(_)
             | Method::PaneClearAgentAuthority(_)
             | Method::PaneReleaseAgent(_)
+            | Method::RunCapabilityIssue(_)
+            | Method::RunSubmit(_)
+            | Method::RunCancel(_)
             | Method::PaneClose(_)
             | Method::PopupClose(_)
             | Method::PluginUnlink(_)
@@ -93,3 +96,4 @@ pub type ApiRequestSender = mpsc::UnboundedSender<ApiRequestMessage>;
 pub fn socket_path() -> PathBuf {
     crate::session::active_api_socket_path()
 }
+pub(crate) mod responses;

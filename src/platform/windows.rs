@@ -84,7 +84,155 @@ use windows_sys::{
     },
 };
 
-use super::{ClipboardImage, ForegroundJob, Signal};
+use super::{ClipboardImage, ForegroundJob, PeerAuthority, Signal};
+
+/// Determine whether a named-pipe client has the same Windows user SID.
+///
+/// The private pipe DACL limits connection access. This second check
+/// impersonates the connected client and compares token user SIDs. A failed
+/// revert returns `None` so the connection thread can exit without handling a
+/// request while impersonated.
+pub(crate) fn local_socket_peer_authority(
+    stream: &crate::ipc::LocalStream,
+) -> Option<PeerAuthority> {
+    use std::mem::size_of;
+    use std::os::windows::io::{AsHandle as _, AsRawHandle as _};
+
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        Security::{
+            EqualSid, GetTokenInformation, RevertToSelf, TokenUser, TOKEN_QUERY, TOKEN_USER,
+        },
+        System::{
+            Pipes::ImpersonateNamedPipeClient,
+            Threading::{GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken},
+        },
+    };
+
+    enum PeerLookupError {
+        Unknown,
+        RevertFailed,
+    }
+
+    fn token_user(token: HANDLE) -> std::io::Result<Vec<usize>> {
+        let mut bytes = 0_u32;
+        unsafe {
+            GetTokenInformation(token, TokenUser, null_mut(), 0, &mut bytes);
+        }
+        if bytes == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let word_count = usize::try_from(bytes)
+            .ok()
+            .and_then(|bytes| bytes.checked_add(size_of::<usize>() - 1))
+            .map(|bytes| bytes / size_of::<usize>())
+            .ok_or_else(|| std::io::Error::other("token user data is too large"))?;
+        let mut buffer = vec![0_usize; word_count];
+        let ok = unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                bytes,
+                &mut bytes,
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(buffer)
+    }
+
+    fn open_process_token(process: HANDLE) -> std::io::Result<HANDLE> {
+        let mut token = std::ptr::null_mut();
+        let ok = unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(token)
+    }
+
+    fn owner_token_user() -> std::io::Result<Vec<usize>> {
+        let token = open_process_token(unsafe { GetCurrentProcess() })?;
+        let user = token_user(token);
+        unsafe {
+            CloseHandle(token);
+        }
+        user
+    }
+
+    fn client_token_user(pipe: HANDLE) -> Result<Vec<usize>, PeerLookupError> {
+        if unsafe { ImpersonateNamedPipeClient(pipe) } == 0 {
+            return Err(PeerLookupError::Unknown);
+        }
+        let user = (|| {
+            let mut token = std::ptr::null_mut();
+            if unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let user = token_user(token);
+            unsafe {
+                CloseHandle(token);
+            }
+            user
+        })();
+        if unsafe { RevertToSelf() } == 0 {
+            return Err(PeerLookupError::RevertFailed);
+        }
+        user.map_err(|_| PeerLookupError::Unknown)
+    }
+
+    fn same_user_sid(pipe: HANDLE) -> Result<bool, PeerLookupError> {
+        let owner = owner_token_user().map_err(|_| PeerLookupError::Unknown)?;
+        let client = client_token_user(pipe)?;
+        let owner_sid = unsafe { (*(owner.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+        let client_sid = unsafe { (*(client.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+        Ok(unsafe { EqualSid(owner_sid, client_sid) != 0 })
+    }
+
+    let crate::ipc::LocalStream::NamedPipe(pipe) = stream;
+    let pipe = pipe.as_handle().as_raw_handle();
+    match same_user_sid(pipe) {
+        Ok(true) => Some(PeerAuthority::Owner),
+        Ok(false) => Some(PeerAuthority::OtherUser),
+        Err(PeerLookupError::Unknown) => Some(PeerAuthority::Unknown),
+        Err(PeerLookupError::RevertFailed) => None,
+    }
+}
+
+pub(crate) fn replace_file_atomically(
+    temporary: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::iter::once;
+    use std::os::windows::ffi::OsStrExt as _;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let temporary: Vec<u16> = temporary.as_os_str().encode_wide().chain(once(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(once(0))
+        .collect();
+    if unsafe {
+        MoveFileExW(
+            temporary.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub(crate) fn sync_parent_directory(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
 
 const STILL_ACTIVE: u32 = 259;
 const FOREGROUND_PROCESS_SNAPSHOT_CACHE_TTL: Duration = Duration::from_millis(250);

@@ -446,6 +446,20 @@ impl TerminalRuntime {
         self.0.keyboard_protocol()
     }
 
+    /// Encode staged prompt text and its separate submit key.
+    pub(crate) fn run_submission_parts(&self, text: &str) -> (Vec<u8>, Vec<u8>) {
+        let text = if self.bracketed_paste_enabled() {
+            format!("\x1b[200~{text}\x1b[201~").into_bytes()
+        } else {
+            text.as_bytes().to_vec()
+        };
+        let enter = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        (text, self.encode_terminal_key(enter.into()))
+    }
+
     pub fn encode_terminal_key(&self, key: crate::input::TerminalKey) -> Vec<u8> {
         self.0.encode_terminal_key(key)
     }
@@ -464,6 +478,19 @@ impl TerminalRuntime {
 
     pub fn pending_delayed_input_count(&self) -> usize {
         self.0.pending_delayed_input_count()
+    }
+
+    pub fn schedule_run_bytes_after(
+        &self,
+        run_id: String,
+        bytes: Bytes,
+        delay: std::time::Duration,
+    ) {
+        self.0.schedule_run_bytes_after(run_id, bytes, delay);
+    }
+
+    pub fn cancel_scheduled_run_input(&self, run_id: &str) -> Option<Bytes> {
+        self.0.cancel_scheduled_run_input(run_id)
     }
 
     pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {
@@ -590,6 +617,22 @@ impl TerminalRuntime {
     ) -> (Self, mpsc::Receiver<Bytes>) {
         let (runtime, rx) =
             crate::pane::PaneRuntime::test_with_channel_capacity(cols, rows, capacity);
+        (Self(runtime), rx)
+    }
+
+    pub(crate) fn test_with_channel_and_input_observer<F>(
+        cols: u16,
+        rows: u16,
+        input_observer: F,
+    ) -> (Self, mpsc::Receiver<Bytes>)
+    where
+        F: Fn(&Bytes) + Send + Sync + 'static,
+    {
+        let (runtime, rx) = crate::pane::PaneRuntime::test_with_channel_and_input_observer(
+            cols,
+            rows,
+            input_observer,
+        );
         (Self(runtime), rx)
     }
 

@@ -99,6 +99,7 @@ impl PaneClickState {
 
 pub struct App {
     pub state: AppState,
+    pub(crate) run_service: crate::server::runs::RunService,
     pub(crate) pane_graphics: pane_graphics::Runtime,
     pub(crate) pane_graphics_files: Arc<crate::pane_graphics_files::FileStore>,
     pub(crate) direct_graphics_available: bool,
@@ -754,12 +755,14 @@ impl App {
                 .and_then(|ws| ws.focused_pane_id().map(|pane_id| (idx, pane_id)))
         });
 
+        let run_service = crate::server::runs::RunService::load(no_session);
         let mut app = Self {
             config_diagnostic_deadline: None,
             toast_deadline: None,
             copy_feedback_deadline: None,
             last_api_notification_at: None,
             state,
+            run_service,
             pane_graphics: pane_graphics::Runtime::default(),
             pane_graphics_files: Arc::new(crate::pane_graphics_files::FileStore::default()),
             direct_graphics_available: false,
@@ -819,9 +822,83 @@ impl App {
             config_reloaded_from_disk: false,
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
         };
+        app.reconcile_run_registry_after_startup();
         app.configure_tab_bar_status(&config.ui.tab_bar_right, &config.ui.tab_bar_right_separator);
         app.configure_window_title(&config.ui.window_title);
         app
+    }
+
+    fn reconcile_run_registry_after_startup(&mut self) {
+        self.run_service
+            .reconcile_after_startup(&self.restored_run_bindings());
+    }
+
+    fn restored_run_bindings(&self) -> HashSet<crate::runs::RunObservationBinding> {
+        let mut bindings = HashSet::new();
+        for workspace_index in 0..self.state.workspaces.len() {
+            let workspace = &self.state.workspaces[workspace_index];
+            let workspace_id = workspace.id.clone();
+            let checkout_path = workspace
+                .worktree_space()
+                .map(|space| space.checkout_path.display().to_string())
+                .unwrap_or_else(|| workspace.identity_cwd.display().to_string());
+            let pane_ids: Vec<_> = workspace
+                .tabs
+                .iter()
+                .flat_map(|tab| tab.layout.pane_ids())
+                .collect();
+            for pane_id in pane_ids {
+                if self
+                    .lookup_runtime_sender(workspace_index, pane_id)
+                    .is_none()
+                {
+                    continue;
+                }
+                let Some(terminal_id) = workspace.terminal_id(pane_id) else {
+                    continue;
+                };
+                let Some(terminal) = self.state.terminals.get(terminal_id) else {
+                    continue;
+                };
+                let Some(agent_name) = terminal
+                    .agent_name
+                    .as_deref()
+                    .or_else(|| terminal.effective_agent_label())
+                else {
+                    continue;
+                };
+                let session_ref = terminal
+                    .hook_authority
+                    .as_ref()
+                    .and_then(|authority| authority.session_ref.as_ref())
+                    .or_else(|| {
+                        terminal
+                            .persisted_agent_session
+                            .as_ref()
+                            .map(|session| &session.session_ref)
+                    });
+                let Some(agent_session_id) = session_ref.map(|session| session.value.clone())
+                else {
+                    continue;
+                };
+                let Some(public_pane_id) = self.public_pane_id(workspace_index, pane_id) else {
+                    continue;
+                };
+                bindings.insert(crate::runs::RunObservationBinding {
+                    workspace_id: workspace_id.clone(),
+                    checkout_path: checkout_path.clone(),
+                    pane_id: public_pane_id,
+                    agent_name: Some(agent_name.to_string()),
+                    agent_session_id,
+                });
+            }
+        }
+        bindings
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_run_registry_path_for_test(&mut self, path: std::path::PathBuf) {
+        self.run_service = crate::server::runs::RunService::load_from_path(path);
     }
 
     #[cfg(unix)]
@@ -886,6 +963,8 @@ impl App {
         } else {
             state::Mode::Navigate
         };
+        app.run_service = crate::server::runs::RunService::load(false);
+        app.reconcile_run_registry_after_startup();
         app.last_focus = app.state.active.and_then(|idx| {
             app.state
                 .workspaces
