@@ -14,14 +14,14 @@ def message_error(text):
     lines = text.splitlines()
     if not lines or len(lines[0]) > 100 or not re.fullmatch(rf'({TYPES})(\([a-z0-9][a-z0-9-]*\))?!?: \S.*', lines[0]):
         return 'Use a Conventional Commit header, at most 100 characters.'
-    if not re.search(r'(?im)^(Refs|Fixes) (NAK|OPS|APP|GMD)-[1-9][0-9]*\b', '\n'.join(lines[1:])):
+    if not re.search(r'(?aim)^(Refs|Fixes) [A-Z][A-Z0-9]*-[1-9][0-9]*(?=\s|$)', '\n'.join(lines[1:])):
         return 'Include Refs TEAM-123 or Fixes TEAM-123 in the commit body.'
     return None
 
 def branch_error(branch, profile):
     if branch in [profile['default_branch'], *profile.get('existing_branches', [])]:
         return None
-    if re.fullmatch(rf'({TYPES}|feature)/(NAK|OPS|APP|GMD)-[1-9][0-9]*-[a-z0-9][a-z0-9-]*', branch):
+    if re.fullmatch(rf'({TYPES}|feature)/[A-Z][A-Z0-9]*-[1-9][0-9]*-[a-z0-9][a-z0-9-]*', branch):
         return None
     return 'Use type/TEAM-123-description. Existing published branches remain valid.'
 
@@ -32,11 +32,16 @@ def main():
     p.add_argument('--format-only',action='store_true')
     args=p.parse_args()
     if args.command=='self-test':
-        for team in ['NAK','OPS','APP','GMD']:
+        for team in ['NAK','OPS','APP','GMD','DOC','ABC','QA2','Z']:
             assert message_error(f'fix: retain draft\n\nRefs {team}-946') is None
             assert branch_error(f'fix/{team}-946-delivery',{'default_branch':'main'}) is None
         for text in ['', 'fix: missing issue', 'NAK-946: wrong header', 'fix: missing word\n\nNAK-946']:
             assert message_error(text)
+        for ticket in ['', 'ABC', 'ABC-0', 'ABC-01', 'ABC-one', '123-4']:
+            assert message_error(f'fix: retain ticket\n\nRefs {ticket}')
+            assert branch_error(f'fix/{ticket}-description', {'default_branch':'main'})
+        for suffix in ['garbage', '.5', '/other', '_tail', '-extra']:
+            assert message_error(f'fix: retain ticket\n\nRefs ABC-123{suffix}')
         assert branch_error('fix/cx/NAK-946-new',{'default_branch':'main'})
         assert branch_error('old/OPS-1',{'default_branch':'main','existing_branches':['old/OPS-1']}) is None
         print('Kaicho 2.1 delivery tests passed.');return 0
